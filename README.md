@@ -1,0 +1,242 @@
+# Vision MCP Server
+
+为 Claude Code 提供图像识别能力的 MCP server，附带 HTTP 图片拦截代理，让纯文本模型（如 GLM）也能接受图片输入，暂只支持用 kimi 来提供视觉能力。
+
+## 功能特性
+
+本项目包含两部分，可独立或组合使用：
+
+### 1. MCP 工具（默认）
+
+支持三种图片来源：
+
+| 工具 | 输入 | 示例 |
+|------|------|------|
+| `kimi_describe_image` | 本地图片文件 | `C:/Users/me/screenshot.png` |
+| `kimi_describe_image` | 网络图片 URL | `https://example.com/img.png` |
+| `kimi_describe_clipboard` | 系统剪贴板图片（直接 `Ctrl+C` 复制，无需先保存为文件） | - |
+
+通过 [Moonshot](https://platform.moonshot.cn) Kimi 视觉模型（如 `kimi-k2.6`）识别，跨平台支持 Windows / macOS / Linux。
+
+### 2. HTTP 图片拦截代理（可选）
+- 用户在 Claude Code 中直接 `Ctrl+V` 粘贴图片即可
+- 在 Claude Code 和上游 LLM API 之间做代理
+- 自动拦截请求中的图片，调 Moonshot 识别后替换为文字描述
+- 让纯文本模型（如 GLM）也能正常处理图片输入，不再 400 报错
+
+## 工作原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Claude Code                                                      │
+│   ├─ 调用 MCP 工具 kimi_describe_image/clipboard → Moonshot API  │
+│   └─ 发送消息（含图片）→ http://127.0.0.1:8787 (本代理)          │
+│                            ↓                                     │
+│                  代理拦截图片 → 调 Moonshot 识别 → 替换为文字    │
+│                            ↓                                     │
+│                  转发纯文本请求 → 上游 LLM API（如 GLM）         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+MCP 工具和代理共享同一进程、同一份 Moonshot 配置，启动 MCP server 时代理自动起来。
+
+## 前置条件
+
+- Node.js >= 18
+- Moonshot API Key（在 [platform.moonshot.cn](https://platform.moonshot.cn) 申请）
+
+构建产物在 `dist/index.js`。
+
+## 配置
+
+### 1. 基础配置（启用 MCP 工具）
+
+编辑 `~/.claude.json`，加入 MCP server 配置，默认识别剪贴板图片，无需粘贴：
+
+```json
+{
+  "mcpServers": {
+    "vision-mcp": {
+      "command": "node",
+      "args": ["/absolute/path/to/vision-mcp/dist/index.js"],
+      "env": {
+        "MOONSHOT_API_KEY": "sk-你的-moonshot-api-key",
+        "MOONSHOT_BASE_URL": "https://api.kimi.com/coding/v1"
+      }
+    }
+  }
+}
+```
+
+重启 Claude Code 后，对 Claude 说"识别剪贴板里的图片"或"识别 C:/xxx.png"，Claude 会自动调用识图工具。
+
+### 2. 高级配置（启用图片代理，可选）
+
+**什么时候需要**：你用 GLM 等纯文本模型，想在 Claude Code 里直接 `Ctrl+V` 粘贴图片（不用先说"识别图片"）。代理会自动拦截图片，调 Moonshot 识别后转发给上游模型。
+
+| 用法 | 怎么识图 |
+|------|----------|
+| 只用 MCP 工具（默认） | 无需粘贴对 Claude 说"识别图片"，自动读取剪贴板图片 |
+| 启用图片代理 | 直接 `Ctrl+V` 粘贴图片到 Claude |
+
+#### 配置步骤
+
+**第 1 步**：编辑 `~/.claude.json`，配置 MCP server（在基础配置基础上加 `UPSTREAM_BASE_URL`）：
+
+```json
+{
+  "mcpServers": {
+    "vision-mcp": {
+      "command": "node",
+      "args": ["/absolute/path/to/vision-mcp/dist/index.js"],
+      "env": {
+        "MOONSHOT_API_KEY": "sk-你的-moonshot-key",
+        "MOONSHOT_BASE_URL": "https://api.kimi.com/coding/v1",
+        "UPSTREAM_BASE_URL": "https://你的上游-llm-api-地址"
+      }
+    }
+  }
+}
+```
+
+**第 2 步**：编辑 `~/.claude/settings.json`，配置 Claude Code 走代理：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+    "ANTHROPIC_AUTH_TOKEN": "你的上游-llm-api-token"
+  }
+}
+```
+
+> 两处 `env` 作用不同：
+> - `~/.claude/settings.json` 的 `env`：Claude Code 自身读取（走代理 + 上游认证）
+> - `~/.claude.json` 里 `mcpServers.vision-mcp.env`：MCP server 进程读取（Moonshot key + 上游纯文本模型请求地址）
+
+**第 3 步**：重启 Claude Code，直接 `Ctrl+V` 粘贴图片即可。
+
+#### 环境变量参考
+
+**Claude Code 端**（`~/.claude/settings.json` 的 `env`）：
+
+| 环境变量 | 必填 | 说明 |
+|---------|------|------|
+| `ANTHROPIC_BASE_URL` | 是 | `http://127.0.0.1:8787`，代理监听端口从该 URL 解析 |
+| `ANTHROPIC_AUTH_TOKEN` | 是 | 上游 LLM API 的认证 token，代理转发时复用 |
+
+**MCP server 端**（`~/.claude.json` 的 `mcpServers.vision-mcp.env`）：
+
+| 环境变量 | 必填 | 默认值 | 说明 |
+|---------|------|--------|------|
+| `UPSTREAM_BASE_URL` | 是 | - | 上游 LLM API 地址，未设则代理不启动（MCP 工具仍可用） |
+| `UPSTREAM_AUTH_TOKEN` | 否 | 取自 `ANTHROPIC_AUTH_TOKEN` | 上游认证 token |
+| `MOONSHOT_API_KEY` | 是 | - | Moonshot API key（MCP 工具与代理共用） |
+| `MOONSHOT_BASE_URL` | 是 | - | Moonshot API 端点（如 `https://api.kimi.com/coding/v1`） |
+| `MOONSHOT_MODEL` | 否 | `kimi-k2.6` | Moonshot 视觉模型名 |
+| `IMAGE_DESC_PROMPT` | 否 | 内置中文提示词 | 代理识别图片时发给 Moonshot 的提示词 |
+| `ALLOW_PRIVATE_NETWORK_IMAGES` | 否 | - | 设为 `1` 或 `true` 允许访问内网图片 URL（默认拒绝，防 SSRF） |
+
+
+## 使用示例
+
+### 用 MCP 工具识图
+
+默认提示词为 **"请详细描述这张图片的内容。"**。你也可以在对话里指定其他指令，例如"提取图片中的所有文字"、"分析图表数据"、"描述 UI 界面布局"。
+
+对 Claude 说：
+
+```
+识别剪贴板里的图片（先 Ctrl+C 复制一张图）
+```
+```
+识别这张图：C:/Users/me/screenshot.png
+```
+```
+描述一下这张网络图片：https://example.com/chart.png
+```
+
+Claude 会自动调用 `kimi_describe_clipboard` 或 `kimi_describe_image` 工具。
+
+### 用代理粘贴图片（配置代理后）
+
+在 Claude Code 输入框里直接 `Ctrl+V` 粘贴图片，再输入问题回车：
+
+```
+[粘贴图片] 这张图里有什么？
+```
+
+代理自动识别图片，把描述和你的问题一起发给上游模型。
+
+## 工具参数
+
+### `kimi_describe_image`
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `image` | string | 是 | - | 本地文件路径或 http(s):// 图片 URL |
+| `prompt` | string | 否 | "请详细描述这张图片的内容。" | 识图指令，最长 4000 字符 |
+| `max_tokens` | number | 否 | 2048 | 返回描述的最大 token 数，1-8192 |
+
+### `kimi_describe_clipboard`
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `prompt` | string | 否 | "请详细描述这张图片的内容。" | 识图指令，最长 4000 字符 |
+| `max_tokens` | number | 否 | 2048 | 返回描述的最大 token 数，1-8192 |
+
+## 限制
+
+- 图片大小上限 20MB（URL 下载与剪贴板读取均适用）
+- 请求超时 60s（Moonshot API）、30s（图片下载）
+- 输出文本超过 25000 字符会截断
+- 支持格式：JPEG / JPG / PNG / GIF / WebP / BMP
+
+## 故障排查
+
+| 错误 | 解决方案 |
+|------|----------|
+| `MOONSHOT_API_KEY 环境变量未设置` | 检查 MCP 配置的 `env.MOONSHOT_API_KEY` |
+| `Moonshot API 鉴权失败 (401)` | API key 错误或失效 |
+| `Moonshot API 模型不存在 (404)` | 模型名错误（当前用 `kimi-k2.6`） |
+| `Moonshot API 限流 (429)` | 请求过于频繁，稍后重试 |
+| `无法访问本地文件` | 路径错误或无权限 |
+| `下载图片失败` | URL 无法访问或超时 |
+| `剪贴板中没有图片` | 先复制一张图片到剪贴板 |
+| `listen EADDRINUSE 127.0.0.1:8787` | 端口被占用，改 `ANTHROPIC_BASE_URL` 里的端口或关掉占用进程 |
+| 代理启动失败但 MCP 工具可用 | 不影响 MCP 工具功能，仅代理不可用 |
+
+## 开发
+
+```bash
+npm run dev     # 开发模式（tsx watch，热重载）
+npm run build   # 编译 TypeScript → dist/
+npm run clean   # 清理构建产物
+```
+
+## 跨平台剪贴板支持
+
+`kimi_describe_clipboard` 工具的剪贴板读取策略：
+
+| 平台 | 优先方案 | 回退方案 |
+|------|----------|----------|
+| Windows | PowerShell + System.Windows.Forms | - |
+| macOS | `pngpaste`（`brew install pngpaste`） | `osascript` |
+| Linux | `xclip` | `xsel`（`sudo apt install xclip`） |
+
+## 安装与构建
+
+```bash
+git clone https://github.com/staticdeng/vision-mcp.git
+cd vision-mcp
+npm install
+npm run build
+```
+
+## 贡献
+
+欢迎提 issue 和 PR。当前只支持 Moonshot Kimi，后续计划扩展其他视觉模型（OpenAI、Gemini、通义千问等），架构上已预留扩展点。
+
+## License
+
+[MIT](LICENSE)

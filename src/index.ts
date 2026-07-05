@@ -1,0 +1,70 @@
+#!/usr/bin/env node
+/**
+ * Vision MCP Server
+ *
+ * 通过视觉模型提供识图能力的 MCP server。
+ * 使用 stdio 传输，供 Claude Code 本地调用。
+ *
+ * 同时启动 HTTP 图片拦截代理：拦截 Claude Code 发往上游 API 的图片请求，
+ * 调用 Moonshot 识别后替换为文字描述，避免 GLM 等纯文本模型 400 报错。
+ * 配置 ANTHROPIC_BASE_URL=http://127.0.0.1:8787 即可启用。
+ */
+
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { registerDescribeImageTool } from "./tools/describeImage.js";
+import { registerDescribeClipboardTool } from "./tools/describeClipboard.js";
+import { startImageProxy } from "./proxy/imageProxy.js";
+import { cleanupOldTempImages } from "./services/clipboard.js";
+
+function getRequiredEnv(name: string, hint: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    console.error(`[vision-mcp] 错误: ${name} 环境变量未设置`);
+    console.error(`[vision-mcp] ${hint}`);
+    process.exit(1);
+  }
+  return value;
+}
+
+async function main(): Promise<void> {
+  // 0. fail-fast 校验必需的环境变量
+  const apiKey = getRequiredEnv(
+    "MOONSHOT_API_KEY",
+    "请在 MCP 配置的 env 里设置 MOONSHOT_API_KEY"
+  );
+  getRequiredEnv(
+    "MOONSHOT_BASE_URL",
+    "请在 MCP 配置的 env 里设置 MOONSHOT_BASE_URL（如 https://api.moonshot.cn/v1）"
+  );
+
+  // 1. 清理上次进程异常退出残留的临时图片
+  await cleanupOldTempImages();
+
+  // 2. 启动 HTTP 图片拦截代理（与 MCP 共存于同一进程）
+  try {
+    await startImageProxy();
+  } catch (err) {
+    console.error("[vision-mcp] 代理启动失败（不影响 MCP 功能）:", err);
+  }
+
+  // 3. 启动 MCP 服务器
+  const server = new McpServer({
+    name: "vision-mcp-server",
+    version: "1.0.0",
+  });
+
+  registerDescribeImageTool(server, () => apiKey);
+  registerDescribeClipboardTool(server, () => apiKey);
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("[vision-mcp] server running via stdio");
+}
+
+main().catch((err) => {
+  console.error("[vision-mcp] fatal:", err);
+  process.exit(1);
+});
+
+

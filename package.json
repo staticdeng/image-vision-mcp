@@ -1,0 +1,50 @@
+{
+  "name": "vision-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for image recognition via vision models (extensible to multiple providers), with an HTTP image-intercepting proxy that lets text-only LLMs accept image input in Claude Code.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "vision-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "clean": "rm -rf dist"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "author": "vision-mcp contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/staticdeng/vision-mcp.git"
+  },
+  "homepage": "https://github.com/staticdeng/vision-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/staticdeng/vision-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "claude-code",
+    "vision",
+    "image-recognition",
+    "moonshot",
+    "kimi",
+    "clipboard",
+    "anthropic"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "axios": "^1.7.9",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
