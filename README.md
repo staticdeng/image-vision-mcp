@@ -224,13 +224,23 @@ npm run clean   # 清理构建产物
 | macOS | `pngpaste`（`brew install pngpaste`） | `osascript` |
 | Linux | `xclip` | `xsel`（`sudo apt install xclip`） |
 
-## 安装与构建
+## 安装
 
-```bash
-git clone https://github.com/staticdeng/vision-mcp.git
-cd vision-mcp
-npm install
-npm run build
+发布到 npm 后，直接在 MCP 配置里用 `npx` 启动。`-y` 表示自动下载并运行 `image-vision-mcp` 包：
+
+```json
+{
+  "mcpServers": {
+    "vision-mcp": {
+      "command": "npx",
+      "args": ["-y", "image-vision-mcp"],
+      "env": {
+        "MOONSHOT_API_KEY": "sk-你的-moonshot-api-key",
+        "MOONSHOT_BASE_URL": "https://api.moonshot.cn/v1"
+      }
+    }
+  }
+}
 ```
 
 ## 贡献

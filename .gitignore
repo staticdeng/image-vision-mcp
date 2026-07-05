@@ -10,6 +10,9 @@ dist/
 .env.local
 .env.*.local
 
+# npm 配置（含发布 token，禁止提交）
+.npmrc
+
 # 日志
 *.log
 proxy/proxy.log
