@@ -14,7 +14,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerDescribeImageTool } from "./tools/describeImage.js";
 import { registerDescribeClipboardTool } from "./tools/describeClipboard.js";
-import { startImageProxy } from "./proxy/imageProxy.js";
+import { ensureImageProxyRunning } from "./proxy/imageProxy.js";
 import { cleanupOldTempImages } from "./services/clipboard.js";
 
 function getRequiredEnv(name: string, hint: string): string {
@@ -41,11 +41,12 @@ async function main(): Promise<void> {
   // 1. 清理上次进程异常退出残留的临时图片
   await cleanupOldTempImages();
 
-  // 2. 启动 HTTP 图片拦截代理（与 MCP 共存于同一进程）
+  // 2. 按需拉起独立常驻的 HTTP 图片拦截代理（与 MCP 进程解耦：
+  //    代理脱离任何会话独立运行，关掉任意窗口都不影响它）
   try {
-    await startImageProxy();
+    await ensureImageProxyRunning();
   } catch (err) {
-    console.error("[vision-mcp] 代理启动失败（不影响 MCP 功能）:", err);
+    console.error("[vision-mcp] 代理拉起失败（不影响 MCP 功能）:", err);
   }
 
   // 3. 启动 MCP 服务器
