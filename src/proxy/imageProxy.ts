@@ -6,6 +6,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawn } from "child_process";
+import crypto from "crypto";
 import { callMoonshot } from "../services/moonshot.js";
 
 // ────────────────────── 日志 ──────────────────────
@@ -58,35 +59,112 @@ const IMAGE_DESC_PROMPT =
 
 // ────────────────────── 图片识别 ──────────────────────
 
+// ────────────────────── 图片识别缓存 ──────────────────────
+
+// Claude Code 每次请求都带完整对话历史，历史里的图片会被反复识别（每张 30-60s）。
+// 用 base64 的 sha256 做 key 缓存识别结果，同一张图只识别一次。
+// LRU 淘汰：Map 按插入顺序，命中时删除重插移到末尾，超限时删最早的。
+const IMAGE_CACHE_MAX = 100;
+const imageCache = new Map<string, string>();
+
+function hashImage(base64Data: string): string {
+  return crypto.createHash("sha256").update(base64Data).digest("hex").slice(0, 32);
+}
+
+function getCachedDescription(base64Data: string): string | null {
+  const key = hashImage(base64Data);
+  const desc = imageCache.get(key);
+  if (desc) {
+    imageCache.delete(key);
+    imageCache.set(key, desc); // 移到末尾，标记为最近使用
+    return desc;
+  }
+  return null;
+}
+
+function setCachedDescription(base64Data: string, description: string): void {
+  const key = hashImage(base64Data);
+  imageCache.set(key, description);
+  if (imageCache.size > IMAGE_CACHE_MAX) {
+    const oldestKey = imageCache.keys().next().value;
+    if (oldestKey) imageCache.delete(oldestKey);
+  }
+}
+
+// 失败短期缓存：识别失败（超时/空响应）的图 5 分钟内不重试，
+// 避免对话历史里某张图每次请求都卡 60s 超时。过期后允许重试（Moonshot 恢复后能成功）。
+const FAILURE_CACHE_TTL_MS = 5 * 60 * 1000;
+const failureCache = new Map<string, number>(); // hash -> 失败时间戳
+
+function getFailureTimestamp(base64Data: string): number | null {
+  const key = hashImage(base64Data);
+  const ts = failureCache.get(key);
+  if (ts === undefined) return null;
+  failureCache.delete(key); // LRU 移到末尾
+  if (Date.now() - ts > FAILURE_CACHE_TTL_MS) {
+    return null; // 过期，不再缓存
+  }
+  failureCache.set(key, ts);
+  return ts;
+}
+
+function setFailureTimestamp(base64Data: string): void {
+  const key = hashImage(base64Data);
+  failureCache.set(key, Date.now());
+  if (failureCache.size > IMAGE_CACHE_MAX) {
+    const oldestKey = failureCache.keys().next().value;
+    if (oldestKey) failureCache.delete(oldestKey);
+  }
+}
+
 async function describeImage(
   base64Data: string,
   mimeType: string
 ): Promise<string> {
+  // 成功缓存命中：历史消息里反复出现的同一张图不重复调 Moonshot
+  const cached = getCachedDescription(base64Data);
+  if (cached) {
+    log(`[image-proxy] 图片命中缓存，跳过识别`);
+    return cached;
+  }
+  // 失败缓存命中：近期识别失败过的图短期不重试，避免每次请求都卡超时
+  if (getFailureTimestamp(base64Data) !== null) {
+    log(`[image-proxy] 图片命中失败缓存，跳过重试`);
+    throw new Error("图片近期识别失败，跳过重试");
+  }
+
   const dataUrl = `data:${mimeType};base64,${base64Data}`;
   const apiKey = process.env.MOONSHOT_API_KEY || "";
   if (!apiKey) {
     throw new Error("MOONSHOT_API_KEY 未设置");
   }
 
-  const response = await callMoonshot({
-    apiKey,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "image_url", image_url: { url: dataUrl } },
-          { type: "text", text: IMAGE_DESC_PROMPT },
-        ],
-      },
-    ],
-    maxTokens: 2048,
-  });
+  try {
+    const response = await callMoonshot({
+      apiKey,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: dataUrl } },
+            { type: "text", text: IMAGE_DESC_PROMPT },
+          ],
+        },
+      ],
+      maxTokens: 2048,
+    });
 
-  const description = response.choices?.[0]?.message?.content || "";
-  if (!description) {
-    throw new Error("Moonshot API 返回空内容");
+    const description = response.choices?.[0]?.message?.content || "";
+    if (!description) {
+      throw new Error("Moonshot API 返回空内容");
+    }
+    setCachedDescription(base64Data, description);
+    return description;
+  } catch (err) {
+    // 失败：记入失败缓存，短期不再重试（让对话继续，不阻塞 60s）
+    setFailureTimestamp(base64Data);
+    throw err;
   }
-  return description;
 }
 
 // ────────────────────── 处理 messages ──────────────────────

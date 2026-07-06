@@ -1,10 +1,21 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import fs from "fs";
+import os from "os";
+import path from "path";
 import { DescribeClipboardInputSchema } from "../schemas.js";
 import { DEFAULT_MODEL, CHARACTER_LIMIT } from "../constants.js";
 import { readClipboardImage } from "../services/clipboard.js";
 import { callMoonshot, handleMoonshotError } from "../services/moonshot.js";
 import type { DescribeClipboardInput } from "../schemas.js";
 import type { MoonshotContent, MoonshotMessage } from "../types.js";
+
+// 排查用日志：MCP 工具走 stdio，console 输出用户看不到，写文件方便排查耗时
+const LOG_FILE = path.join(os.tmpdir(), "vision-mcp-clipboard.log");
+function log(msg: string): void {
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  console.error(line.trim());
+  fs.appendFile(LOG_FILE, line, () => {});
+}
 
 export function registerDescribeClipboardTool(
   server: McpServer,
@@ -50,11 +61,13 @@ Error Handling:
     },
     async (params: DescribeClipboardInput) => {
       const apiKey = getApiKey();
+      const t0 = Date.now();
 
       // 1. 从剪贴板读取图片
       let imageResult;
       try {
         imageResult = await readClipboardImage();
+        log(`读取剪贴板耗时 ${Date.now() - t0}ms, 图片 ${(imageResult.sizeBytes / 1024).toFixed(1)} KB (${imageResult.mimeType})`);
       } catch (err) {
         return {
           content: [
@@ -74,6 +87,7 @@ Error Handling:
       const messages: MoonshotMessage[] = [{ role: "user", content }];
 
       // 3. 调用 Moonshot API
+      const t1 = Date.now();
       let response;
       try {
         response = await callMoonshot({
@@ -82,6 +96,7 @@ Error Handling:
           messages,
           maxTokens: params.max_tokens,
         });
+        log(`Moonshot 调用耗时 ${Date.now() - t1}ms, completion_tokens=${response.usage?.completion_tokens ?? "?"}`);
       } catch (err) {
         return {
           content: [{ type: "text", text: handleMoonshotError(err) }],
@@ -113,6 +128,7 @@ Error Handling:
         text = text.slice(0, CHARACTER_LIMIT) + `\n\n[已截断，原文长度 ${text.length} 字符]`;
       }
 
+      log(`总耗时 ${Date.now() - t0}ms`);
       return {
         content: [{ type: "text", text }],
       };
