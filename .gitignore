@@ -15,6 +15,7 @@ dist/
 
 # 日志
 *.log
+logs/
 proxy/proxy.log
 
 # 操作系统

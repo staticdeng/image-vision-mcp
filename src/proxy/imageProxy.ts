@@ -11,11 +11,26 @@ import { callMoonshot } from "../services/moonshot.js";
 
 // ────────────────────── 日志 ──────────────────────
 
-// 日志文件路径：优先用环境变量，否则放系统临时目录（跨平台、无需权限处理）
+// 日志文件路径：优先用环境变量，否则放项目内 logs/ 目录。
+// 用 import.meta.url 定位 dist/proxy/ → 反推项目根：独立代理进程是 detached
+// spawn 的，cwd 不可靠（可能继承自任意 Claude Code 会话），只能用脚本自身位置定位。
+const PROJECT_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  ".."
+);
 const LOG_FILE =
   process.env.VISION_MCP_LOG_FILE ||
-  path.join(os.tmpdir(), "vision-mcp-proxy.log");
+  path.join(PROJECT_ROOT, "logs", "vision-mcp-proxy.log");
 const LOG_MAX_SIZE = 10 * 1024 * 1024; // 10MB，超过后清空旧日志
+
+// 确保日志目录存在（环境变量覆盖到自定义路径时同样需要）。同步创建一次即可，
+// 失败也不影响代理功能——后续 appendFile 会静默失败，请求转发不受影响。
+try {
+  fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+} catch {
+  // 目录已存在或无权限，忽略
+}
 
 function log(msg: string): void {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
@@ -270,10 +285,17 @@ async function processMessages(messages: Message[]): Promise<Message[]> {
 
 // ────────────────────── 转发请求 ──────────────────────
 
+interface ForwardMeta {
+  reqStart: number; // 请求进入代理的时间戳（毫秒）
+  hasImage: boolean; // 是否含图片（决定是否走过识别流程）
+  origSizeKB: string; // 原始请求体大小（KB），用于观察对话体积
+}
+
 function forwardRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  body: string | null
+  body: string | null,
+  meta: ForwardMeta | null
 ): void {
   const baseUrl = new URL(UPSTREAM_BASE_URL);
   const basePath = baseUrl.pathname.replace(/\/+$/, "");
@@ -305,12 +327,25 @@ function forwardRequest(
   };
 
   const proxyReq = lib.request(options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+    const status = proxyRes.statusCode || 502;
+    if (meta) {
+      const elapsed = Date.now() - meta.reqStart;
+      const pathOnly = (req.url || "").split("?")[0];
+      log(
+        `[转发] ${req.method} ${pathOnly} ${status} body=${meta.origSizeKB}KB ${meta.hasImage ? "有图" : "无图"} 耗时=${elapsed}ms`
+      );
+    }
+    res.writeHead(status, proxyRes.headers);
     proxyRes.pipe(res);
   });
 
   proxyReq.on("error", (err: Error) => {
-    log(`[image-proxy] 转发失败: ${err.message}`);
+    if (meta) {
+      const elapsed = Date.now() - meta.reqStart;
+      log(`[image-proxy] 转发失败 (耗时=${elapsed}ms): ${err.message}`);
+    } else {
+      log(`[image-proxy] 转发失败: ${err.message}`);
+    }
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(
@@ -411,11 +446,16 @@ export function startImageProxy(): Promise<void> {
     process.on("exit", releaseOnExit);
 
     const server = http.createServer(async (req, res) => {
+      const reqStart = Date.now();
       const isMessagesEndpoint =
         req.method === "POST" && (req.url || "").includes("/v1/messages");
 
       if (!isMessagesEndpoint) {
-        forwardRequest(req, res, null);
+        forwardRequest(req, res, null, {
+          reqStart,
+          hasImage: false,
+          origSizeKB: "?",
+        });
         return;
       }
 
@@ -472,13 +512,22 @@ export function startImageProxy(): Promise<void> {
             }
           }
 
+          const origSizeKB = (Buffer.byteLength(rawBody) / 1024).toFixed(1);
           if (hasImage) {
             log(`[image-proxy] 检测到图片，开始识别...`);
             requestData.messages = await processMessages(requestData.messages);
             const newBody = JSON.stringify(requestData);
-            forwardRequest(req, res, newBody);
+            forwardRequest(req, res, newBody, {
+              reqStart,
+              hasImage: true,
+              origSizeKB,
+            });
           } else {
-            forwardRequest(req, res, rawBody);
+            forwardRequest(req, res, rawBody, {
+              reqStart,
+              hasImage: false,
+              origSizeKB,
+            });
           }
         } catch (err) {
           log(`[image-proxy] 处理失败: ${(err as Error).message}`);
