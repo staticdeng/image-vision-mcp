@@ -13,9 +13,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerDescribeImageTool } from "./tools/describeImage.js";
-import { registerDescribeClipboardTool } from "./tools/describeClipboard.js";
 import { ensureImageProxyRunning } from "./proxy/imageProxy.js";
-import { cleanupOldTempImages } from "./services/clipboard.js";
 
 function getRequiredEnv(name: string, hint: string): string {
   const value = process.env[name]?.trim();
@@ -38,10 +36,7 @@ async function main(): Promise<void> {
     "请在 MCP 配置的 env 里设置 MOONSHOT_BASE_URL（如 https://api.moonshot.cn/v1）"
   );
 
-  // 1. 清理上次进程异常退出残留的临时图片
-  await cleanupOldTempImages();
-
-  // 2. 按需拉起独立常驻的 HTTP 图片拦截代理（与 MCP 进程解耦：
+  // 1. 按需拉起独立常驻的 HTTP 图片拦截代理（与 MCP 进程解耦：
   //    代理脱离任何会话独立运行，关掉任意窗口都不影响它）
   try {
     await ensureImageProxyRunning();
@@ -49,14 +44,13 @@ async function main(): Promise<void> {
     console.error("[vision-mcp] 代理拉起失败（不影响 MCP 功能）:", err);
   }
 
-  // 3. 启动 MCP 服务器
+  // 2. 启动 MCP 服务器
   const server = new McpServer({
     name: "vision-mcp-server",
     version: "1.0.0",
   });
 
   registerDescribeImageTool(server, () => apiKey);
-  registerDescribeClipboardTool(server, () => apiKey);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -67,5 +61,3 @@ main().catch((err) => {
   console.error("[vision-mcp] fatal:", err);
   process.exit(1);
 });
-
-

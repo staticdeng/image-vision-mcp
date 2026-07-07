@@ -40,7 +40,6 @@
     "image-recognition",
     "moonshot",
     "kimi",
-    "clipboard",
     "anthropic"
   ],
   "dependencies": {
