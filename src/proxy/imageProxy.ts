@@ -72,6 +72,10 @@ const IMAGE_DESC_PROMPT =
   process.env.IMAGE_DESC_PROMPT ||
   "请详细描述这张图片的内容。如果是图表/截图，请提取关键信息；如果包含文字，请提取文字内容；如果是 UI 界面，请描述界面元素和布局。描述要简洁准确。";
 
+// 复用到上游模型的连接，减少慢流式响应场景下频繁建连的额外开销。
+const upstreamHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
+const upstreamHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
+
 // ────────────────────── 图片识别 ──────────────────────
 
 // ────────────────────── 图片识别缓存 ──────────────────────
@@ -81,6 +85,17 @@ const IMAGE_DESC_PROMPT =
 // LRU 淘汰：Map 按插入顺序，命中时删除重插移到末尾，超限时删最早的。
 const IMAGE_CACHE_MAX = 100;
 const imageCache = new Map<string, string>();
+
+interface PendingImageDescription {
+  promise?: Promise<string>;
+  controller: AbortController;
+  waiters: number;
+  settled: boolean;
+}
+
+// 同一张图片可能同时出现在多个并发请求或历史消息里。复用进行中的识别，
+// 只有所有等待者都取消时才中止底层 Moonshot 请求，避免误伤其他请求。
+const pendingImageDescriptions = new Map<string, PendingImageDescription>();
 
 function hashImage(base64Data: string): string {
   return crypto.createHash("sha256").update(base64Data).digest("hex").slice(0, 32);
@@ -132,10 +147,54 @@ function setFailureTimestamp(base64Data: string): void {
   }
 }
 
+function isCanceledError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return (
+    err.name === "CanceledError" ||
+    err.message === "canceled" ||
+    err.message.includes("请求已取消")
+  );
+}
+
+async function waitForPendingImage(
+  task: PendingImageDescription,
+  signal?: AbortSignal
+): Promise<string> {
+  task.waiters++;
+  let removeAbortListener = (): void => {};
+
+  try {
+    if (!signal) {
+      return await task.promise!;
+    }
+    if (signal.aborted) {
+      throw new Error("请求已取消");
+    }
+
+    return await new Promise<string>((resolve, reject) => {
+      const onAbort = (): void => reject(new Error("请求已取消"));
+      removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+      signal.addEventListener("abort", onAbort, { once: true });
+      task.promise!.then(resolve, reject);
+    });
+  } finally {
+    removeAbortListener();
+    task.waiters--;
+    if (task.waiters === 0 && !task.settled) {
+      task.controller.abort();
+    }
+  }
+}
+
 async function describeImage(
   base64Data: string,
-  mimeType: string
+  mimeType: string,
+  signal?: AbortSignal
 ): Promise<string> {
+  if (signal?.aborted) {
+    throw new Error("请求已取消");
+  }
+
   // 成功缓存命中：历史消息里反复出现的同一张图不重复调 Moonshot
   const cached = getCachedDescription(base64Data);
   if (cached) {
@@ -154,32 +213,56 @@ async function describeImage(
     throw new Error("MOONSHOT_API_KEY 未设置");
   }
 
-  try {
-    const response = await callMoonshot({
-      apiKey,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "image_url", image_url: { url: dataUrl } },
-            { type: "text", text: IMAGE_DESC_PROMPT },
-          ],
-        },
-      ],
-      maxTokens: 2048,
-    });
-
-    const description = response.choices?.[0]?.message?.content || "";
-    if (!description) {
-      throw new Error("Moonshot API 返回空内容");
-    }
-    setCachedDescription(base64Data, description);
-    return description;
-  } catch (err) {
-    // 失败：记入失败缓存，短期不再重试（让对话继续，不阻塞 60s）
-    setFailureTimestamp(base64Data);
-    throw err;
+  const key = hashImage(base64Data);
+  const pending = pendingImageDescriptions.get(key);
+  if (pending) {
+    log(`[image-proxy] 图片识别进行中，复用同一个请求`);
+    return waitForPendingImage(pending, signal);
   }
+
+  const task: PendingImageDescription = {
+    controller: new AbortController(),
+    waiters: 0,
+    settled: false,
+  };
+
+  task.promise = (async (): Promise<string> => {
+    try {
+      const response = await callMoonshot({
+        apiKey,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "image_url", image_url: { url: dataUrl } },
+              { type: "text", text: IMAGE_DESC_PROMPT },
+            ],
+          },
+        ],
+        maxTokens: 2048,
+        signal: task.controller.signal,
+      });
+
+      const description = response.choices?.[0]?.message?.content || "";
+      if (!description) {
+        throw new Error("Moonshot API 返回空内容");
+      }
+      setCachedDescription(base64Data, description);
+      return description;
+    } catch (err) {
+      // 失败：记入失败缓存，短期不再重试（让对话继续，不阻塞 60s）
+      if (!isCanceledError(err)) {
+        setFailureTimestamp(base64Data);
+      }
+      throw err;
+    } finally {
+      task.settled = true;
+      pendingImageDescriptions.delete(key);
+    }
+  })();
+
+  pendingImageDescriptions.set(key, task);
+  return waitForPendingImage(task, signal);
 }
 
 // ────────────────────── 处理 messages ──────────────────────
@@ -199,14 +282,70 @@ interface Message {
   content: string | ContentBlock[];
 }
 
+const IMAGE_MARKER_RE =
+  /"type"\s*:\s*"(image|image_url|tool_result)"|"source"\s*:\s*\{\s*"type"\s*:\s*"base64"|data:image\/[a-z+.-]+;base64,/i;
+
+function mayContainImagePayload(rawBody: string): boolean {
+  // 大多数消息无图，先用轻量文本探测跳过 JSON.parse 和深度扫描。
+  return IMAGE_MARKER_RE.test(rawBody);
+}
+
+function contentHasImage(content: unknown): boolean {
+  if (!Array.isArray(content)) return false;
+  for (const block of content as ContentBlock[]) {
+    if (block?.type === "image" || block?.type === "image_url") {
+      return true;
+    }
+    if (block?.type === "tool_result" && contentHasImage(block.content)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function collectForwardedImageTexts(content: unknown, result: string[]): void {
+  if (!Array.isArray(content)) return;
+  for (const block of content as ContentBlock[]) {
+    if (
+      block?.type === "text" &&
+      typeof block.text === "string" &&
+      (
+        block.text.includes("[以下是用户粘贴的图片内容描述]") ||
+        block.text.includes("[以下是截图内容描述]") ||
+        block.text.includes("[图片识别失败:")
+      )
+    ) {
+      result.push(block.text);
+    }
+    if (block?.type === "tool_result") {
+      collectForwardedImageTexts(block.content, result);
+    }
+  }
+}
+
+function logForwardedImageTexts(messages: unknown): void {
+  if (!Array.isArray(messages)) return;
+
+  const forwardedTexts: string[] = [];
+  for (const message of messages) {
+    if (message && typeof message === "object" && "content" in message) {
+      collectForwardedImageTexts((message as Message).content, forwardedTexts);
+    }
+  }
+
+  forwardedTexts.forEach((text, index) => {
+    log(`[image-proxy] 转发到上游 /v1/messages 的图片内容 #${index + 1} (${text.length} chars):\n${text}`);
+  });
+}
+
 // 处理单个 content block：图片类型识别后替换为文字，其余原样返回。
 // 同层数组的多个图片块由调用方 Promise.all 并行触发，这里只负责单块转换。
-async function describeBlock(block: ContentBlock): Promise<ContentBlock> {
+async function describeBlock(block: ContentBlock, signal?: AbortSignal): Promise<ContentBlock> {
   // 格式1: Anthropic 标准 {"type":"image","source":{"type":"base64",...}}
   if (block?.type === "image" && block.source?.type === "base64") {
     const { media_type, data } = block.source as { media_type: string; data: string };
     try {
-      const description = await describeImage(data, media_type);
+      const description = await describeImage(data, media_type, signal);
       log(`[image-proxy] 图片已识别 (${media_type}, ${Math.round((data.length * 0.75) / 1024)} KB)`);
       return {
         type: "text",
@@ -230,7 +369,7 @@ async function describeBlock(block: ContentBlock): Promise<ContentBlock> {
     if (match) {
       const [, media_type, data] = match;
       try {
-        const description = await describeImage(data, media_type);
+        const description = await describeImage(data, media_type, signal);
         log(`[image-proxy] image_url 图片已识别 (${media_type})`);
         return {
           type: "text",
@@ -249,7 +388,7 @@ async function describeBlock(block: ContentBlock): Promise<ContentBlock> {
   // 格式3: tool_result 里嵌套图片（MCP 工具返回的截图）
   if (block?.type === "tool_result" && Array.isArray(block.content)) {
     const toolContent = block.content as ContentBlock[];
-    const processed = await processContent(toolContent);
+    const processed = await processContent(toolContent, signal);
     return { ...block, content: processed } as ContentBlock;
   }
   // 其他未识别的 image source type
@@ -260,7 +399,8 @@ async function describeBlock(block: ContentBlock): Promise<ContentBlock> {
 }
 
 async function processContent(
-  content: string | ContentBlock[]
+  content: string | ContentBlock[],
+  signal?: AbortSignal
 ): Promise<string | ContentBlock[]> {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return content;
@@ -270,14 +410,15 @@ async function processContent(
   log(`[image-proxy] content blocks: ${JSON.stringify(blockTypes)}`);
 
   // 并行识别同一层级的所有图片块，map 保持原顺序
-  return Promise.all(content.map((block) => describeBlock(block)));
+  return Promise.all(content.map((block) => describeBlock(block, signal)));
 }
 
-async function processMessages(messages: Message[]): Promise<Message[]> {
+async function processMessages(messages: Message[], signal?: AbortSignal): Promise<Message[]> {
   if (!Array.isArray(messages)) return messages;
   for (const message of messages) {
+    if (signal?.aborted) throw new Error("请求已取消");
     if (message && typeof message === "object" && message.content !== undefined) {
-      message.content = await processContent(message.content) as string | ContentBlock[];
+      message.content = await processContent(message.content, signal) as string | ContentBlock[];
     }
   }
   return messages;
@@ -295,26 +436,34 @@ function forwardRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   body: string | null,
-  meta: ForwardMeta | null
+  meta: ForwardMeta | null,
+  signal?: AbortSignal
 ): void {
   const baseUrl = new URL(UPSTREAM_BASE_URL);
   const basePath = baseUrl.pathname.replace(/\/+$/, "");
   const fullPath = basePath + (req.url || "");
   const isHttps = baseUrl.protocol === "https:";
   const lib = isHttps ? https : http;
+  const upstreamUrl = new URL(fullPath, baseUrl.origin).toString();
+  const pathOnly = (req.url || "").split("?")[0];
+  if (meta) {
+    const elapsed = Date.now() - meta.reqStart;
+    log(`[阶段] 转发开始 ${req.method} ${pathOnly} -> ${upstreamUrl} body=${meta.origSizeKB}KB ${meta.hasImage ? "有图" : "无图"} elapsed=${elapsed}ms`);
+  }
 
   const headers = { ...req.headers } as Record<string, string>;
   delete headers["host"];
-  delete headers["content-length"];
-  // body 已被解压/修改，必须删除原压缩标记和逐跳头，否则上游会尝试解压明文导致失败
-  delete headers["content-encoding"];
-  delete headers["transfer-encoding"];
   headers["host"] = baseUrl.host;
   if (UPSTREAM_AUTH_TOKEN) {
     headers["authorization"] = `Bearer ${UPSTREAM_AUTH_TOKEN}`;
     headers["x-api-key"] = UPSTREAM_AUTH_TOKEN;
   }
-  if (body) {
+
+  if (body !== null) {
+    delete headers["content-length"];
+    // body 已被解压/修改，必须删除原压缩标记和逐跳头，否则上游会尝试解压明文导致失败
+    delete headers["content-encoding"];
+    delete headers["transfer-encoding"];
     headers["content-length"] = String(Buffer.byteLength(body));
   }
 
@@ -324,27 +473,35 @@ function forwardRequest(
     port: baseUrl.port || (isHttps ? 443 : 80),
     path: fullPath,
     headers,
+    agent: isHttps ? upstreamHttpsAgent : upstreamHttpAgent,
+    signal,
   };
 
   const proxyReq = lib.request(options, (proxyRes) => {
     const status = proxyRes.statusCode || 502;
     if (meta) {
       const elapsed = Date.now() - meta.reqStart;
-      const pathOnly = (req.url || "").split("?")[0];
       log(
-        `[转发] ${req.method} ${pathOnly} ${status} body=${meta.origSizeKB}KB ${meta.hasImage ? "有图" : "无图"} 耗时=${elapsed}ms`
+        `[阶段] 上游响应 ${req.method} ${pathOnly} -> ${upstreamUrl} status=${status} body=${meta.origSizeKB}KB ${meta.hasImage ? "有图" : "无图"} 首包耗时=${elapsed}ms`
       );
+    }
+    if (res.destroyed) {
+      proxyRes.destroy();
+      return;
     }
     res.writeHead(status, proxyRes.headers);
     proxyRes.pipe(res);
   });
 
   proxyReq.on("error", (err: Error) => {
+    if (signal?.aborted || isCanceledError(err) || err.name === "AbortError") {
+      return;
+    }
     if (meta) {
       const elapsed = Date.now() - meta.reqStart;
-      log(`[image-proxy] 转发失败 (耗时=${elapsed}ms): ${err.message}`);
+      log(`[image-proxy] 转发失败 ${req.method} ${pathOnly} -> ${upstreamUrl} (耗时=${elapsed}ms): ${err.message}`);
     } else {
-      log(`[image-proxy] 转发失败: ${err.message}`);
+      log(`[image-proxy] 转发失败 ${req.method} ${pathOnly} -> ${upstreamUrl}: ${err.message}`);
     }
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });
@@ -354,12 +511,13 @@ function forwardRequest(
     }
   });
 
-  if (body) {
-    proxyReq.write(body);
+  if (body !== null) {
+    proxyReq.end(body);
   } else {
     req.pipe(proxyReq);
+    req.on("aborted", () => proxyReq.destroy(new Error("客户端请求已取消")));
+    req.on("error", (err) => proxyReq.destroy(err));
   }
-  proxyReq.end();
 }
 
 // ────────────────────── 单例锁 ──────────────────────
@@ -447,15 +605,32 @@ export function startImageProxy(): Promise<void> {
 
     const server = http.createServer(async (req, res) => {
       const reqStart = Date.now();
+      // Claude Code 中断/重试时立即取消本轮代理工作，避免旧请求继续占用
+      // Moonshot 调用或上游流式连接。
+      const requestController = new AbortController();
+      const abortRequest = (): void => {
+        if (!res.writableEnded) {
+          requestController.abort();
+        }
+      };
+      req.on("aborted", abortRequest);
+      res.on("close", abortRequest);
+
+      // /v1/messages 是 Anthropic Claude Messages API 端点，只有这类请求的 body
+      // 里才可能带图片，需要读全 body 拦截处理；其它请求（/v1/models、健康检查等）
+      // 直接透传，不解析 body 以省开销。用 includes 而非 === 是因为 url 可能带
+      // query string 或 UPSTREAM_BASE_URL 的 basePath 前缀。
       const isMessagesEndpoint =
         req.method === "POST" && (req.url || "").includes("/v1/messages");
+      const pathOnly = (req.url || "").split("?")[0];
+      log(`[阶段] 接收 ${req.method} ${pathOnly}`);
 
       if (!isMessagesEndpoint) {
         forwardRequest(req, res, null, {
           reqStart,
           hasImage: false,
           origSizeKB: "?",
-        });
+        }, requestController.signal);
         return;
       }
 
@@ -464,6 +639,9 @@ export function startImageProxy(): Promise<void> {
       req.on("end", async () => {
         const buffer = Buffer.concat(chunks);
         const contentEncoding = (req.headers["content-encoding"] || "").toLowerCase();
+        log(
+          `[阶段] body读取完成 ${req.method} ${pathOnly} size=${(buffer.length / 1024).toFixed(1)}KB encoding=${contentEncoding || "none"} elapsed=${Date.now() - reqStart}ms`
+        );
 
         // 解压请求体（支持 gzip / deflate / br），否则 JSON.parse 会失败
         let rawBody: string;
@@ -477,6 +655,9 @@ export function startImageProxy(): Promise<void> {
           } else {
             rawBody = buffer.toString("utf8");
           }
+          log(
+            `[阶段] body解码完成 ${req.method} ${pathOnly} rawSize=${(Buffer.byteLength(rawBody) / 1024).toFixed(1)}KB elapsed=${Date.now() - reqStart}ms`
+          );
         } catch (err) {
           log(`[image-proxy] 请求体解压失败: ${(err as Error).message}`);
           if (!res.headersSent) {
@@ -491,45 +672,49 @@ export function startImageProxy(): Promise<void> {
         }
 
         try {
+          const origSizeKB = (Buffer.byteLength(rawBody) / 1024).toFixed(1);
+          if (!mayContainImagePayload(rawBody)) {
+            log(`[阶段] 无图快速转发 ${req.method} ${pathOnly} elapsed=${Date.now() - reqStart}ms`);
+            forwardRequest(req, res, rawBody, {
+              reqStart,
+              hasImage: false,
+              origSizeKB,
+            }, requestController.signal);
+            return;
+          }
+
           const requestData = JSON.parse(rawBody);
+          log(`[阶段] JSON解析完成 ${req.method} ${pathOnly} elapsed=${Date.now() - reqStart}ms`);
           let hasImage = false;
           if (Array.isArray(requestData.messages)) {
             for (const msg of requestData.messages) {
-              if (Array.isArray(msg.content)) {
-                for (const block of msg.content) {
-                  // 检测所有可能的图片格式
-                  if (
-                    block?.type === "image" ||
-                    block?.type === "image_url" ||
-                    (block?.type === "tool_result" && Array.isArray(block.content))
-                  ) {
-                    hasImage = true;
-                    break;
-                  }
-                }
-              }
+              hasImage = contentHasImage(msg.content);
               if (hasImage) break;
             }
           }
 
-          const origSizeKB = (Buffer.byteLength(rawBody) / 1024).toFixed(1);
           if (hasImage) {
             log(`[image-proxy] 检测到图片，开始识别...`);
-            requestData.messages = await processMessages(requestData.messages);
+            requestData.messages = await processMessages(requestData.messages, requestController.signal);
+            log(`[阶段] 图片处理完成 ${req.method} ${pathOnly} elapsed=${Date.now() - reqStart}ms`);
+            logForwardedImageTexts(requestData.messages);
             const newBody = JSON.stringify(requestData);
             forwardRequest(req, res, newBody, {
               reqStart,
               hasImage: true,
               origSizeKB,
-            });
+            }, requestController.signal);
           } else {
             forwardRequest(req, res, rawBody, {
               reqStart,
               hasImage: false,
               origSizeKB,
-            });
+            }, requestController.signal);
           }
         } catch (err) {
+          if (requestController.signal.aborted || isCanceledError(err)) {
+            return;
+          }
           log(`[image-proxy] 处理失败: ${(err as Error).message}`);
           if (!res.headersSent) {
             res.writeHead(500, { "Content-Type": "application/json" });

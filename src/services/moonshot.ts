@@ -1,12 +1,44 @@
 import axios, { AxiosError } from "axios";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import { API_BASE_URL, DEFAULT_MODEL, REQUEST_TIMEOUT_MS } from "../constants.js";
-import type { MoonshotChatResponse, MoonshotMessage } from "../types.js";
+import type { MoonshotChatResponse, MoonshotMessage, MoonshotContent } from "../types.js";
+
+const PROJECT_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  ".."
+);
+const LOG_FILE =
+  process.env.VISION_MCP_LOG_FILE ||
+  path.join(PROJECT_ROOT, "logs", "vision-mcp-proxy.log");
+const LOG_MAX_SIZE = 10 * 1024 * 1024;
+
+try {
+  fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+} catch {
+  // 日志不可写不影响正常调用。
+}
+
+function logMoonshot(msg: string): void {
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  console.error(line.trim());
+  fs.stat(LOG_FILE, (statErr, stats) => {
+    if (statErr || stats.size < LOG_MAX_SIZE) {
+      fs.appendFile(LOG_FILE, line, () => {});
+    } else {
+      fs.writeFile(LOG_FILE, line, () => {});
+    }
+  });
+}
 
 export interface CallMoonshotParams {
   apiKey: string;
   model?: string;
   messages: MoonshotMessage[];
   maxTokens?: number;
+  signal?: AbortSignal;
 }
 
 export function handleMoonshotError(error: unknown): string {
@@ -40,6 +72,9 @@ export function handleMoonshotError(error: unknown): string {
     if (error.code === "ENOTFOUND" || error.code === "ECONNREFUSED") {
       return `Error: 无法连接 Moonshot API (${error.code})。请检查网络。`;
     }
+    if (error.code === "ERR_CANCELED" || error.message === "canceled") {
+      return "Error: Moonshot API 请求已取消。";
+    }
   }
   return `Error: 调用 Moonshot API 时发生意外错误: ${error instanceof Error ? error.message : String(error)}`;
 }
@@ -47,17 +82,76 @@ export function handleMoonshotError(error: unknown): string {
 const MAX_RETRIES = 2;
 const INITIAL_RETRY_DELAY_MS = 1000;
 
+function summarizeContent(content: string | MoonshotContent[]): unknown {
+  if (typeof content === "string") {
+    return { type: "text", chars: content.length, preview: content.slice(0, 120) };
+  }
+  if (!Array.isArray(content)) return { type: typeof content };
+
+  return content.map((block) => {
+    if (block.type === "text") {
+      return {
+        type: "text",
+        chars: block.text.length,
+        preview: block.text.slice(0, 120),
+      };
+    }
+    if (block.type === "image_url") {
+      const url = block.image_url.url;
+      const dataUrlMatch = url.match(/^data:(image\/[^;]+);base64,(.*)$/i);
+      if (dataUrlMatch) {
+        return {
+          type: "image_url",
+          mimeType: dataUrlMatch[1],
+          sizeKB: ((dataUrlMatch[2].length * 0.75) / 1024).toFixed(1),
+        };
+      }
+      return { type: "image_url", url };
+    }
+    const fallbackBlock = block as { type?: string };
+    return { type: fallbackBlock.type || typeof block };
+  });
+}
+
+// 重试退避也要响应取消，否则客户端已经中断时还会继续占着任务。
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  if (signal.aborted) return Promise.reject(new Error("Moonshot API 请求已取消"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(new Error("Moonshot API 请求已取消"));
+      },
+      { once: true }
+    );
+  });
+}
+
 export async function callMoonshot(params: CallMoonshotParams): Promise<MoonshotChatResponse> {
-  const { apiKey, model = DEFAULT_MODEL, messages, maxTokens = 2048 } = params;
+  const { apiKey, model = DEFAULT_MODEL, messages, maxTokens = 2048, signal } = params;
   if (!apiKey) {
     throw new Error("MOONSHOT_API_KEY 未设置");
   }
+
+  const requestUrl = `${API_BASE_URL}/chat/completions`;
+  const requestSummary = {
+    model,
+    max_tokens: maxTokens,
+    messages: messages.map((message) => ({
+      role: message.role,
+      content: summarizeContent(message.content),
+    })),
+  };
+  logMoonshot(`[Moonshot] POST ${requestUrl} body=${JSON.stringify(requestSummary)}`);
 
   let lastError: unknown;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
       const response = await axios.post<MoonshotChatResponse>(
-        `${API_BASE_URL}/chat/completions`,
+        requestUrl,
         {
           model,
           messages,
@@ -65,6 +159,7 @@ export async function callMoonshot(params: CallMoonshotParams): Promise<Moonshot
         },
         {
           timeout: REQUEST_TIMEOUT_MS,
+          signal,
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${apiKey}`,
@@ -77,7 +172,7 @@ export async function callMoonshot(params: CallMoonshotParams): Promise<Moonshot
       // 仅对 429 限流重试，指数退避：1s, 2s
       if (err instanceof AxiosError && err.response?.status === 429 && attempt < MAX_RETRIES) {
         const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt);
-        await new Promise((resolve) => setTimeout(resolve, delay));
+        await sleep(delay, signal);
         continue;
       }
       throw err;
