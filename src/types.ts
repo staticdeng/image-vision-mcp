@@ -1,21 +1,21 @@
-export interface MoonshotImageContent {
+export interface VisionImageContent {
   type: "image_url";
   image_url: { url: string };
 }
 
-export interface MoonshotTextContent {
+export interface VisionTextContent {
   type: "text";
   text: string;
 }
 
-export type MoonshotContent = MoonshotImageContent | MoonshotTextContent;
+export type VisionContent = VisionImageContent | VisionTextContent;
 
-export interface MoonshotMessage {
+export interface VisionMessage {
   role: "user" | "assistant" | "system";
-  content: string | MoonshotContent[];
+  content: string | VisionContent[];
 }
 
-export interface MoonshotChoice {
+export interface VisionChoice {
   index: number;
   message: {
     role: string;
@@ -24,19 +24,19 @@ export interface MoonshotChoice {
   finish_reason: string;
 }
 
-export interface MoonshotUsage {
+export interface VisionUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
 }
 
-export interface MoonshotChatResponse {
+export interface VisionChatResponse {
   id: string;
   object: string;
   created: number;
   model: string;
-  choices: MoonshotChoice[];
-  usage: MoonshotUsage;
+  choices: VisionChoice[];
+  usage: VisionUsage;
 }
 
 export interface ImageLoadResult {

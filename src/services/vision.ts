@@ -3,7 +3,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { API_BASE_URL, DEFAULT_MODEL, REQUEST_TIMEOUT_MS } from "../constants.js";
-import type { MoonshotChatResponse, MoonshotMessage, MoonshotContent } from "../types.js";
+import type { VisionChatResponse, VisionMessage, VisionContent } from "../types.js";
 
 const PROJECT_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -21,8 +21,17 @@ try {
   // 日志不可写不影响正常调用。
 }
 
-function logMoonshot(msg: string): void {
-  const line = `[${new Date().toISOString()}] ${msg}\n`;
+function nowLocal(): string {
+  const d = new Date();
+  const pad = (n: number, l = 2) => String(n).padStart(l, "0");
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`
+  );
+}
+
+function logVision(msg: string): void {
+  const line = `[${nowLocal()}] ${msg}\n`;
   console.error(line.trim());
   fs.stat(LOG_FILE, (statErr, stats) => {
     if (statErr || stats.size < LOG_MAX_SIZE) {
@@ -33,15 +42,15 @@ function logMoonshot(msg: string): void {
   });
 }
 
-export interface CallMoonshotParams {
+export interface CallVisionParams {
   apiKey: string;
   model?: string;
-  messages: MoonshotMessage[];
+  messages: VisionMessage[];
   maxTokens?: number;
   signal?: AbortSignal;
 }
 
-export function handleMoonshotError(error: unknown): string {
+export function handleVisionError(error: unknown): string {
   if (error instanceof AxiosError) {
     if (error.response) {
       const status = error.response.status;
@@ -51,38 +60,38 @@ export function handleMoonshotError(error: unknown): string {
       const errMsg = data?.error?.message;
       switch (status) {
         case 401:
-          return `Error: Moonshot API 鉴权失败 (401)。请检查 MOONSHOT_API_KEY 是否正确。${errMsg ? ` 详情: ${errMsg}` : ""}`;
+          return `Error: 视觉模型 API 鉴权失败 (401)。请检查 VISION_API_KEY 是否正确。${errMsg ? ` 详情: ${errMsg}` : ""}`;
         case 403:
-          return `Error: Moonshot API 拒绝访问 (403)。可能是 API key 无权限调用该模型。${errMsg ? ` 详情: ${errMsg}` : ""}`;
+          return `Error: 视觉模型 API 拒绝访问 (403)。可能是 API key 无权限调用该模型。${errMsg ? ` 详情: ${errMsg}` : ""}`;
         case 404:
-          return `Error: Moonshot API 模型不存在 (404)。请检查模型名是否正确 (当前: ${DEFAULT_MODEL})。${errMsg ? ` 详情: ${errMsg}` : ""}`;
+          return `Error: 视觉模型 API 模型不存在 (404)。请检查模型名是否正确 (当前: ${DEFAULT_MODEL})。${errMsg ? ` 详情: ${errMsg}` : ""}`;
         case 429:
-          return `Error: Moonshot API 限流 (429)。请稍后重试。${errMsg ? ` 详情: ${errMsg}` : ""}`;
+          return `Error: 视觉模型 API 限流 (429)。请稍后重试。${errMsg ? ` 详情: ${errMsg}` : ""}`;
         case 500:
         case 502:
         case 503:
-          return `Error: Moonshot API 服务端错误 (${status})。请稍后重试。${errMsg ? ` 详情: ${errMsg}` : ""}`;
+          return `Error: 视觉模型 API 服务端错误 (${status})。请稍后重试。${errMsg ? ` 详情: ${errMsg}` : ""}`;
         default:
-          return `Error: Moonshot API 请求失败 (HTTP ${status})。${errMsg ? ` 详情: ${errMsg}` : ""}`;
+          return `Error: 视觉模型 API 请求失败 (HTTP ${status})。${errMsg ? ` 详情: ${errMsg}` : ""}`;
       }
     }
     if (error.code === "ECONNABORTED") {
-      return `Error: Moonshot API 请求超时 (${REQUEST_TIMEOUT_MS}ms)。请稍后重试。`;
+      return `Error: 视觉模型 API 请求超时 (${REQUEST_TIMEOUT_MS}ms)。请稍后重试。`;
     }
     if (error.code === "ENOTFOUND" || error.code === "ECONNREFUSED") {
-      return `Error: 无法连接 Moonshot API (${error.code})。请检查网络。`;
+      return `Error: 无法连接视觉模型 API (${error.code})。请检查网络。`;
     }
     if (error.code === "ERR_CANCELED" || error.message === "canceled") {
-      return "Error: Moonshot API 请求已取消。";
+      return "Error: 视觉模型 API 请求已取消。";
     }
   }
-  return `Error: 调用 Moonshot API 时发生意外错误: ${error instanceof Error ? error.message : String(error)}`;
+  return `Error: 调用视觉模型 API 时发生意外错误: ${error instanceof Error ? error.message : String(error)}`;
 }
 
 const MAX_RETRIES = 2;
 const INITIAL_RETRY_DELAY_MS = 1000;
 
-function summarizeContent(content: string | MoonshotContent[]): unknown {
+function summarizeContent(content: string | VisionContent[]): unknown {
   if (typeof content === "string") {
     return { type: "text", chars: content.length, preview: content.slice(0, 120) };
   }
@@ -116,24 +125,24 @@ function summarizeContent(content: string | MoonshotContent[]): unknown {
 // 重试退避也要响应取消，否则客户端已经中断时还会继续占着任务。
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
-  if (signal.aborted) return Promise.reject(new Error("Moonshot API 请求已取消"));
+  if (signal.aborted) return Promise.reject(new Error("视觉模型 API 请求已取消"));
   return new Promise((resolve, reject) => {
     const timer = setTimeout(resolve, ms);
     signal.addEventListener(
       "abort",
       () => {
         clearTimeout(timer);
-        reject(new Error("Moonshot API 请求已取消"));
+        reject(new Error("视觉模型 API 请求已取消"));
       },
       { once: true }
     );
   });
 }
 
-export async function callMoonshot(params: CallMoonshotParams): Promise<MoonshotChatResponse> {
+export async function callVision(params: CallVisionParams): Promise<VisionChatResponse> {
   const { apiKey, model = DEFAULT_MODEL, messages, maxTokens = 2048, signal } = params;
   if (!apiKey) {
-    throw new Error("MOONSHOT_API_KEY 未设置");
+    throw new Error("VISION_API_KEY 未设置");
   }
 
   const requestUrl = `${API_BASE_URL}/chat/completions`;
@@ -145,12 +154,12 @@ export async function callMoonshot(params: CallMoonshotParams): Promise<Moonshot
       content: summarizeContent(message.content),
     })),
   };
-  logMoonshot(`[Moonshot] POST ${requestUrl} body=${JSON.stringify(requestSummary)}`);
+  logVision(`[Vision] POST ${requestUrl} body=${JSON.stringify(requestSummary)}`);
 
   let lastError: unknown;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const response = await axios.post<MoonshotChatResponse>(
+      const response = await axios.post<VisionChatResponse>(
         requestUrl,
         {
           model,

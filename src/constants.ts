@@ -1,5 +1,5 @@
-export const API_BASE_URL = process.env.MOONSHOT_BASE_URL?.replace(/\/+$/, "") || "";
-export const DEFAULT_MODEL = process.env.MOONSHOT_MODEL || "kimi-k2.6";
+export const API_BASE_URL = process.env.VISION_BASE_URL?.replace(/\/+$/, "") || "";
+export const DEFAULT_MODEL = process.env.VISION_MODEL || "";
 export const CHARACTER_LIMIT = 25000;
 export const REQUEST_TIMEOUT_MS = 60000;
 export const IMAGE_DOWNLOAD_TIMEOUT_MS = 30000;

@@ -1,6 +1,6 @@
 {
   "name": "image-vision-mcp",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "MCP server for image recognition via vision models (extensible to multiple providers), with an HTTP image-intercepting proxy that lets text-only LLMs accept image input in Claude Code.",
   "type": "module",
   "main": "dist/index.js",
@@ -38,8 +38,8 @@
     "claude-code",
     "vision",
     "image-recognition",
-    "moonshot",
-    "kimi",
+    "vision-model",
+    "doubao",
     "anthropic"
   ],
   "dependencies": {

@@ -7,7 +7,7 @@ import path from "path";
 import os from "os";
 import { spawn } from "child_process";
 import crypto from "crypto";
-import { callMoonshot } from "../services/moonshot.js";
+import { callVision } from "../services/vision.js";
 
 // ────────────────────── 日志 ──────────────────────
 
@@ -32,8 +32,17 @@ try {
   // 目录已存在或无权限，忽略
 }
 
+function nowLocal(): string {
+  const d = new Date();
+  const pad = (n: number, l = 2) => String(n).padStart(l, "0");
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`
+  );
+}
+
 function log(msg: string): void {
-  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  const line = `[${nowLocal()}] ${msg}\n`;
   console.error(line.trim());
   fs.stat(LOG_FILE, (statErr, stats) => {
     if (statErr || stats.size < LOG_MAX_SIZE) {
@@ -94,7 +103,7 @@ interface PendingImageDescription {
 }
 
 // 同一张图片可能同时出现在多个并发请求或历史消息里。复用进行中的识别，
-// 只有所有等待者都取消时才中止底层 Moonshot 请求，避免误伤其他请求。
+// 只有所有等待者都取消时才中止底层 视觉模型 请求，避免误伤其他请求。
 const pendingImageDescriptions = new Map<string, PendingImageDescription>();
 
 function hashImage(base64Data: string): string {
@@ -122,7 +131,7 @@ function setCachedDescription(base64Data: string, description: string): void {
 }
 
 // 失败短期缓存：识别失败（超时/空响应）的图 5 分钟内不重试，
-// 避免对话历史里某张图每次请求都卡 60s 超时。过期后允许重试（Moonshot 恢复后能成功）。
+// 避免对话历史里某张图每次请求都卡 60s 超时。过期后允许重试（视觉模型 恢复后能成功）。
 const FAILURE_CACHE_TTL_MS = 5 * 60 * 1000;
 const failureCache = new Map<string, number>(); // hash -> 失败时间戳
 
@@ -195,7 +204,7 @@ async function describeImage(
     throw new Error("请求已取消");
   }
 
-  // 成功缓存命中：历史消息里反复出现的同一张图不重复调 Moonshot
+  // 成功缓存命中：历史消息里反复出现的同一张图不重复调 视觉模型
   const cached = getCachedDescription(base64Data);
   if (cached) {
     log(`[image-proxy] 图片命中缓存，跳过识别`);
@@ -208,9 +217,9 @@ async function describeImage(
   }
 
   const dataUrl = `data:${mimeType};base64,${base64Data}`;
-  const apiKey = process.env.MOONSHOT_API_KEY || "";
+  const apiKey = process.env.VISION_API_KEY || "";
   if (!apiKey) {
-    throw new Error("MOONSHOT_API_KEY 未设置");
+    throw new Error("VISION_API_KEY 未设置");
   }
 
   const key = hashImage(base64Data);
@@ -228,7 +237,7 @@ async function describeImage(
 
   task.promise = (async (): Promise<string> => {
     try {
-      const response = await callMoonshot({
+      const response = await callVision({
         apiKey,
         messages: [
           {
@@ -245,7 +254,7 @@ async function describeImage(
 
       const description = response.choices?.[0]?.message?.content || "";
       if (!description) {
-        throw new Error("Moonshot API 返回空内容");
+        throw new Error("视觉模型 API 返回空内容");
       }
       setCachedDescription(base64Data, description);
       return description;
@@ -606,7 +615,7 @@ export function startImageProxy(): Promise<void> {
     const server = http.createServer(async (req, res) => {
       const reqStart = Date.now();
       // Claude Code 中断/重试时立即取消本轮代理工作，避免旧请求继续占用
-      // Moonshot 调用或上游流式连接。
+      // 视觉模型 调用或上游流式连接。
       const requestController = new AbortController();
       const abortRequest = (): void => {
         if (!res.writableEnded) {

@@ -6,7 +6,7 @@
  * 使用 stdio 传输，供 Claude Code 本地调用。
  *
  * 同时启动 HTTP 图片拦截代理：拦截 Claude Code 发往上游 API 的图片请求，
- * 调用 Moonshot 识别后替换为文字描述，避免 GLM 等纯文本模型 400 报错。
+ * 调用视觉模型识别后替换为文字描述，避免 GLM 等纯文本模型 400 报错。
  * 配置 ANTHROPIC_BASE_URL=http://127.0.0.1:8787 即可启用。
  */
 
@@ -28,12 +28,16 @@ function getRequiredEnv(name: string, hint: string): string {
 async function main(): Promise<void> {
   // 0. fail-fast 校验必需的环境变量
   const apiKey = getRequiredEnv(
-    "MOONSHOT_API_KEY",
-    "请在 MCP 配置的 env 里设置 MOONSHOT_API_KEY"
+    "VISION_API_KEY",
+    "请在 MCP 配置的 env 里设置 VISION_API_KEY"
   );
   getRequiredEnv(
-    "MOONSHOT_BASE_URL",
-    "请在 MCP 配置的 env 里设置 MOONSHOT_BASE_URL（如 https://api.moonshot.cn/v1）"
+    "VISION_BASE_URL",
+    "请在 MCP 配置的 env 里设置 VISION_BASE_URL（如 https://ark.cn-beijing.volces.com/api/v3）"
+  );
+  getRequiredEnv(
+    "VISION_MODEL",
+    "请在 MCP 配置的 env 里设置 VISION_MODEL（视觉模型 ID，如 doubao-seed-2-1-turbo-260628）"
   );
 
   // 1. 按需拉起独立常驻的 HTTP 图片拦截代理（与 MCP 进程解耦：

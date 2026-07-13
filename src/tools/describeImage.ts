@@ -2,21 +2,21 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { DescribeImageInputSchema } from "../schemas.js";
 import { DEFAULT_MODEL, CHARACTER_LIMIT } from "../constants.js";
 import { loadImageAsDataUrl } from "../services/image.js";
-import { callMoonshot, handleMoonshotError } from "../services/moonshot.js";
+import { callVision, handleVisionError } from "../services/vision.js";
 import type { DescribeImageInput } from "../schemas.js";
-import type { MoonshotContent, MoonshotMessage } from "../types.js";
+import type { VisionContent, VisionMessage } from "../types.js";
 
 export function registerDescribeImageTool(
   server: McpServer,
   getApiKey: () => string
 ): void {
   server.registerTool(
-    "kimi_describe_image",
+    "vision_describe_image",
     {
-      title: "Kimi 识图",
-      description: `使用 Moonshot Kimi 视觉模型 (kimi-k2.6) 识别图片并返回文本描述。
+      title: "视觉识图",
+      description: `使用视觉模型识别图片并返回文本描述。支持任意 OpenAI 兼容的视觉模型（火山方舟豆包、Kimi、智谱 GLM-4V、通义 Qwen-VL、OpenAI GPT-4o 等）。
 
-支持输入本地图片路径或 http(s):// 图片 URL。MCP 内部会自动将图片转换为 base64 后调用 Moonshot API（Moonshot 不支持直接传 URL）。
+支持输入本地图片路径或 http(s):// 图片 URL。MCP 内部会自动将图片转换为 base64 后调用视觉模型 API（多数视觉模型不支持直接传 URL）。
 
 Args:
   - image (string, 必填): 图片路径或 URL。
@@ -37,8 +37,8 @@ Examples:
 Error Handling:
   - "无法访问本地文件": 文件路径错误或无权限
   - "下载图片失败": URL 无法访问或超时
-  - "Moonshot API 鉴权失败 (401)": API key 错误
-  - "Moonshot API 限流 (429)": 请求过于频繁，请稍后重试`,
+  - "视觉模型 API 鉴权失败 (401)": API key 错误
+  - "视觉模型 API 限流 (429)": 请求过于频繁，请稍后重试`,
       inputSchema: DescribeImageInputSchema,
       annotations: {
         readOnlyHint: true,
@@ -65,17 +65,17 @@ Error Handling:
         };
       }
 
-      // 2. 构造 Moonshot 请求
-      const content: MoonshotContent[] = [
+      // 2. 构造视觉模型请求
+      const content: VisionContent[] = [
         { type: "image_url", image_url: { url: imageResult.dataUrl } },
         { type: "text", text: params.prompt },
       ];
-      const messages: MoonshotMessage[] = [{ role: "user", content }];
+      const messages: VisionMessage[] = [{ role: "user", content }];
 
-      // 3. 调用 Moonshot API
+      // 3. 调用视觉模型 API
       let response;
       try {
-        response = await callMoonshot({
+        response = await callVision({
           apiKey,
           model: DEFAULT_MODEL,
           messages,
@@ -83,7 +83,7 @@ Error Handling:
         });
       } catch (err) {
         return {
-          content: [{ type: "text", text: handleMoonshotError(err) }],
+          content: [{ type: "text", text: handleVisionError(err) }],
         };
       }
 
@@ -94,7 +94,7 @@ Error Handling:
           content: [
             {
               type: "text",
-              text: `Error: Moonshot API 返回空内容。完整响应: ${JSON.stringify(response)}`,
+              text: `Error: 视觉模型 API 返回空内容。完整响应: ${JSON.stringify(response)}`,
             },
           ],
         };
