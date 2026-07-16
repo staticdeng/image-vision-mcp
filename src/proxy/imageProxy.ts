@@ -8,6 +8,11 @@ import os from "os";
 import { spawn } from "child_process";
 import crypto from "crypto";
 import { callVision } from "../services/vision.js";
+import { DEFAULT_MAX_TOKENS } from "../constants.js";
+import {
+  DEFAULT_IMAGE_DESC_MODE,
+  buildImageDescriptionPrompt,
+} from "../prompts.js";
 
 // ────────────────────── 日志 ──────────────────────
 
@@ -77,13 +82,16 @@ const UPSTREAM_AUTH_TOKEN =
   process.env.UPSTREAM_AUTH_TOKEN ||
   process.env.ANTHROPIC_AUTH_TOKEN ||
   "";
-const IMAGE_DESC_PROMPT =
-  process.env.IMAGE_DESC_PROMPT ||
-  "请详细描述这张图片的内容。如果是图表/截图，请提取关键信息；如果包含文字，请提取文字内容；如果是 UI 界面，请描述界面元素和布局。描述要简洁准确。";
+const IMAGE_DESC_PROMPT = process.env.IMAGE_DESC_PROMPT?.trim();
 
 // 复用到上游模型的连接，减少慢流式响应场景下频繁建连的额外开销。
 const upstreamHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
 const upstreamHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
+let nextRequestId = 1;
+
+function requestLabel(requestId: number): string {
+  return `[req#${requestId}]`;
+}
 
 // ────────────────────── 图片识别 ──────────────────────
 
@@ -106,12 +114,18 @@ interface PendingImageDescription {
 // 只有所有等待者都取消时才中止底层 视觉模型 请求，避免误伤其他请求。
 const pendingImageDescriptions = new Map<string, PendingImageDescription>();
 
-function hashImage(base64Data: string): string {
-  return crypto.createHash("sha256").update(base64Data).digest("hex").slice(0, 32);
+function hashImage(base64Data: string, prompt: string): string {
+  return crypto
+    .createHash("sha256")
+    .update(base64Data)
+    .update("\n---prompt---\n")
+    .update(prompt)
+    .digest("hex")
+    .slice(0, 32);
 }
 
-function getCachedDescription(base64Data: string): string | null {
-  const key = hashImage(base64Data);
+function getCachedDescription(base64Data: string, prompt: string): string | null {
+  const key = hashImage(base64Data, prompt);
   const desc = imageCache.get(key);
   if (desc) {
     imageCache.delete(key);
@@ -121,38 +135,12 @@ function getCachedDescription(base64Data: string): string | null {
   return null;
 }
 
-function setCachedDescription(base64Data: string, description: string): void {
-  const key = hashImage(base64Data);
+function setCachedDescription(base64Data: string, prompt: string, description: string): void {
+  const key = hashImage(base64Data, prompt);
   imageCache.set(key, description);
   if (imageCache.size > IMAGE_CACHE_MAX) {
     const oldestKey = imageCache.keys().next().value;
     if (oldestKey) imageCache.delete(oldestKey);
-  }
-}
-
-// 失败短期缓存：识别失败（超时/空响应）的图 5 分钟内不重试，
-// 避免对话历史里某张图每次请求都卡 60s 超时。过期后允许重试（视觉模型 恢复后能成功）。
-const FAILURE_CACHE_TTL_MS = 5 * 60 * 1000;
-const failureCache = new Map<string, number>(); // hash -> 失败时间戳
-
-function getFailureTimestamp(base64Data: string): number | null {
-  const key = hashImage(base64Data);
-  const ts = failureCache.get(key);
-  if (ts === undefined) return null;
-  failureCache.delete(key); // LRU 移到末尾
-  if (Date.now() - ts > FAILURE_CACHE_TTL_MS) {
-    return null; // 过期，不再缓存
-  }
-  failureCache.set(key, ts);
-  return ts;
-}
-
-function setFailureTimestamp(base64Data: string): void {
-  const key = hashImage(base64Data);
-  failureCache.set(key, Date.now());
-  if (failureCache.size > IMAGE_CACHE_MAX) {
-    const oldestKey = failureCache.keys().next().value;
-    if (oldestKey) failureCache.delete(oldestKey);
   }
 }
 
@@ -198,22 +186,22 @@ async function waitForPendingImage(
 async function describeImage(
   base64Data: string,
   mimeType: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  userPrompt?: string,
+  requestId?: number
 ): Promise<string> {
   if (signal?.aborted) {
     throw new Error("请求已取消");
   }
 
+  const effectivePrompt =
+    IMAGE_DESC_PROMPT || buildImageDescriptionPrompt(DEFAULT_IMAGE_DESC_MODE, userPrompt);
+
   // 成功缓存命中：历史消息里反复出现的同一张图不重复调 视觉模型
-  const cached = getCachedDescription(base64Data);
+  const cached = getCachedDescription(base64Data, effectivePrompt);
   if (cached) {
-    log(`[image-proxy] 图片命中缓存，跳过识别`);
+    log(`${requestId ? `${requestLabel(requestId)} ` : ""}[image-proxy] 图片命中缓存，跳过识别`);
     return cached;
-  }
-  // 失败缓存命中：近期识别失败过的图短期不重试，避免每次请求都卡超时
-  if (getFailureTimestamp(base64Data) !== null) {
-    log(`[image-proxy] 图片命中失败缓存，跳过重试`);
-    throw new Error("图片近期识别失败，跳过重试");
   }
 
   const dataUrl = `data:${mimeType};base64,${base64Data}`;
@@ -222,10 +210,10 @@ async function describeImage(
     throw new Error("VISION_API_KEY 未设置");
   }
 
-  const key = hashImage(base64Data);
+  const key = hashImage(base64Data, effectivePrompt);
   const pending = pendingImageDescriptions.get(key);
   if (pending) {
-    log(`[image-proxy] 图片识别进行中，复用同一个请求`);
+    log(`${requestId ? `${requestLabel(requestId)} ` : ""}[image-proxy] 图片识别进行中，复用同一个请求`);
     return waitForPendingImage(pending, signal);
   }
 
@@ -237,33 +225,39 @@ async function describeImage(
 
   task.promise = (async (): Promise<string> => {
     try {
-      const response = await callVision({
-        apiKey,
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "image_url", image_url: { url: dataUrl } },
-              { type: "text", text: IMAGE_DESC_PROMPT },
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const response = await callVision({
+            apiKey,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  { type: "image_url", image_url: { url: dataUrl } },
+                  { type: "text", text: effectivePrompt },
+                ],
+              },
             ],
-          },
-        ],
-        maxTokens: 2048,
-        signal: task.controller.signal,
-      });
+            maxTokens: DEFAULT_MAX_TOKENS,
+            signal: task.controller.signal,
+          });
 
-      const description = response.choices?.[0]?.message?.content || "";
-      if (!description) {
-        throw new Error("视觉模型 API 返回空内容");
+          const description = response.choices?.[0]?.message?.content || "";
+          if (!description) {
+            throw new Error("视觉模型 API 返回空内容");
+          }
+          setCachedDescription(base64Data, effectivePrompt, description);
+          return description;
+        } catch (err) {
+          lastError = err;
+          if (isCanceledError(err) || attempt === 2) {
+            throw err;
+          }
+          log(`${requestId ? `${requestLabel(requestId)} ` : ""}[image-proxy] 图片识别失败，准备重试 1 次: ${(err as Error).message}`);
+        }
       }
-      setCachedDescription(base64Data, description);
-      return description;
-    } catch (err) {
-      // 失败：记入失败缓存，短期不再重试（让对话继续，不阻塞 60s）
-      if (!isCanceledError(err)) {
-        setFailureTimestamp(base64Data);
-      }
-      throw err;
+      throw lastError;
     } finally {
       task.settled = true;
       pendingImageDescriptions.delete(key);
@@ -290,6 +284,8 @@ interface Message {
   role: string;
   content: string | ContentBlock[];
 }
+
+type ImageProcessMode = "full" | "historical_placeholder";
 
 const IMAGE_MARKER_RE =
   /"type"\s*:\s*"(image|image_url|tool_result)"|"source"\s*:\s*\{\s*"type"\s*:\s*"base64"|data:image\/[a-z+.-]+;base64,/i;
@@ -332,7 +328,7 @@ function collectForwardedImageTexts(content: unknown, result: string[]): void {
   }
 }
 
-function logForwardedImageTexts(messages: unknown): void {
+function logForwardedImageTexts(messages: unknown, requestId: number): void {
   if (!Array.isArray(messages)) return;
 
   const forwardedTexts: string[] = [];
@@ -343,25 +339,52 @@ function logForwardedImageTexts(messages: unknown): void {
   }
 
   forwardedTexts.forEach((text, index) => {
-    log(`[image-proxy] 转发到上游 /v1/messages 的图片内容 #${index + 1} (${text.length} chars):\n${text}`);
+    log(`${requestLabel(requestId)} [image-proxy] 转发到上游 /v1/messages 的图片内容 #${index + 1} (${text.length} chars):\n${text}`);
   });
+}
+
+function collectSiblingText(content: ContentBlock[]): string | undefined {
+  const text = content
+    .filter((block) => block?.type === "text" && typeof block.text === "string")
+    .map((block) => block.text!.trim())
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, 2000)
+    .trim();
+  return text || undefined;
+}
+
+function previewText(text: string, maxChars = 160): string {
+  return text.replace(/\s+/g, " ").slice(0, maxChars);
 }
 
 // 处理单个 content block：图片类型识别后替换为文字，其余原样返回。
 // 同层数组的多个图片块由调用方 Promise.all 并行触发，这里只负责单块转换。
-async function describeBlock(block: ContentBlock, signal?: AbortSignal): Promise<ContentBlock> {
+async function describeBlock(
+  block: ContentBlock,
+  signal?: AbortSignal,
+  userPrompt?: string,
+  requestId?: number,
+  mode: ImageProcessMode = "full"
+): Promise<ContentBlock> {
   // 格式1: Anthropic 标准 {"type":"image","source":{"type":"base64",...}}
   if (block?.type === "image" && block.source?.type === "base64") {
     const { media_type, data } = block.source as { media_type: string; data: string };
+    if (mode === "historical_placeholder") {
+      return {
+        type: "text",
+        text: `[历史图片已省略: ${media_type}, ${Math.round((data.length * 0.75) / 1024)} KB]`,
+      };
+    }
     try {
-      const description = await describeImage(data, media_type, signal);
-      log(`[image-proxy] 图片已识别 (${media_type}, ${Math.round((data.length * 0.75) / 1024)} KB)`);
+      const description = await describeImage(data, media_type, signal, userPrompt, requestId);
+      log(`${requestId ? `${requestLabel(requestId)} ` : ""}[image-proxy] 图片已识别 (${media_type}, ${Math.round((data.length * 0.75) / 1024)} KB)`);
       return {
         type: "text",
         text: `[以下是用户粘贴的图片内容描述]\n${description}\n[图片描述结束]`,
       };
     } catch (err) {
-      log(`[image-proxy] 图片识别失败: ${(err as Error).message}`);
+      log(`${requestId ? `${requestLabel(requestId)} ` : ""}[image-proxy] 图片识别失败: ${(err as Error).message}`);
       return {
         type: "text",
         text: `[图片识别失败: ${(err as Error).message}]`,
@@ -377,15 +400,21 @@ async function describeBlock(block: ContentBlock, signal?: AbortSignal): Promise
     const match = url.match(/^data:(image\/[a-z+]+);base64,(.+)$/i);
     if (match) {
       const [, media_type, data] = match;
+      if (mode === "historical_placeholder") {
+        return {
+          type: "text",
+          text: `[历史图片已省略: ${media_type}, ${Math.round((data.length * 0.75) / 1024)} KB]`,
+        };
+      }
       try {
-        const description = await describeImage(data, media_type, signal);
-        log(`[image-proxy] image_url 图片已识别 (${media_type})`);
+        const description = await describeImage(data, media_type, signal, userPrompt, requestId);
+        log(`${requestId ? `${requestLabel(requestId)} ` : ""}[image-proxy] image_url 图片已识别 (${media_type})`);
         return {
           type: "text",
           text: `[以下是截图内容描述]\n${description}\n[图片描述结束]`,
         };
       } catch (err) {
-        log(`[image-proxy] image_url 图片识别失败: ${(err as Error).message}`);
+        log(`${requestId ? `${requestLabel(requestId)} ` : ""}[image-proxy] image_url 图片识别失败: ${(err as Error).message}`);
         return {
           type: "text",
           text: `[图片识别失败: ${(err as Error).message}]`,
@@ -397,37 +426,74 @@ async function describeBlock(block: ContentBlock, signal?: AbortSignal): Promise
   // 格式3: tool_result 里嵌套图片（MCP 工具返回的截图）
   if (block?.type === "tool_result" && Array.isArray(block.content)) {
     const toolContent = block.content as ContentBlock[];
-    const processed = await processContent(toolContent, signal);
+    const processed = await processContent(toolContent, signal, requestId, mode);
     return { ...block, content: processed } as ContentBlock;
   }
   // 其他未识别的 image source type
+  if (mode === "historical_placeholder" && block?.type === "image") {
+    return {
+      type: "text",
+      text: "[历史图片已省略: unsupported image source]",
+    };
+  }
   if (block?.type === "image" && block.source && !block.source.type?.startsWith("base64")) {
-    log(`[image-proxy] 未识别的 image source type: ${block.source.type}`);
+    log(`${requestId ? `${requestLabel(requestId)} ` : ""}[image-proxy] 未识别的 image source type: ${block.source.type}`);
   }
   return block;
 }
 
 async function processContent(
   content: string | ContentBlock[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  requestId?: number,
+  mode: ImageProcessMode = "full"
 ): Promise<string | ContentBlock[]> {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return content;
 
   // 日志：记录所有 block 类型，方便排查
   const blockTypes = content.map((b) => b?.type || "unknown");
-  log(`[image-proxy] content blocks: ${JSON.stringify(blockTypes)}`);
+  log(`${requestId ? `${requestLabel(requestId)} ` : ""}[image-proxy] content blocks: ${JSON.stringify(blockTypes)}`);
 
   // 并行识别同一层级的所有图片块，map 保持原顺序
-  return Promise.all(content.map((block) => describeBlock(block, signal)));
+  const siblingText = collectSiblingText(content);
+  if (
+    mode === "full" &&
+    siblingText &&
+    content.some((block) => block?.type === "image" || block?.type === "image_url")
+  ) {
+    log(
+      `${requestId ? `${requestLabel(requestId)} ` : ""}[image-proxy] 图片同层文本将作为识图任务上下文 (${siblingText.length} chars): ${previewText(siblingText)}`
+    );
+  }
+  return Promise.all(content.map((block) => describeBlock(block, signal, siblingText, requestId, mode)));
 }
 
-async function processMessages(messages: Message[], signal?: AbortSignal): Promise<Message[]> {
+async function processMessages(
+  messages: Message[],
+  signal?: AbortSignal,
+  requestId?: number
+): Promise<Message[]> {
   if (!Array.isArray(messages)) return messages;
-  for (const message of messages) {
+  let latestImageMessageIndex = -1;
+  for (let i = 0; i < messages.length; i++) {
+    if (contentHasImage(messages[i]?.content)) {
+      latestImageMessageIndex = i;
+    }
+  }
+  if (requestId && latestImageMessageIndex >= 0) {
+    log(`${requestLabel(requestId)} [image-proxy] 最新含图消息索引: ${latestImageMessageIndex}，更早历史图片将使用短占位`);
+  }
+
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
     if (signal?.aborted) throw new Error("请求已取消");
     if (message && typeof message === "object" && message.content !== undefined) {
-      message.content = await processContent(message.content, signal) as string | ContentBlock[];
+      const mode: ImageProcessMode =
+        latestImageMessageIndex >= 0 && i < latestImageMessageIndex
+          ? "historical_placeholder"
+          : "full";
+      message.content = await processContent(message.content, signal, requestId, mode) as string | ContentBlock[];
     }
   }
   return messages;
@@ -436,6 +502,7 @@ async function processMessages(messages: Message[], signal?: AbortSignal): Promi
 // ────────────────────── 转发请求 ──────────────────────
 
 interface ForwardMeta {
+  requestId: number; // 本代理分配的请求 ID，用于并发日志关联
   reqStart: number; // 请求进入代理的时间戳（毫秒）
   hasImage: boolean; // 是否含图片（决定是否走过识别流程）
   origSizeKB: string; // 原始请求体大小（KB），用于观察对话体积
@@ -457,7 +524,7 @@ function forwardRequest(
   const pathOnly = (req.url || "").split("?")[0];
   if (meta) {
     const elapsed = Date.now() - meta.reqStart;
-    log(`[阶段] 转发开始 ${req.method} ${pathOnly} -> ${upstreamUrl} body=${meta.origSizeKB}KB ${meta.hasImage ? "有图" : "无图"} elapsed=${elapsed}ms`);
+    log(`${requestLabel(meta.requestId)} [阶段] 转发开始 ${req.method} ${pathOnly} -> ${upstreamUrl} body=${meta.origSizeKB}KB ${meta.hasImage ? "有图" : "无图"} elapsed=${elapsed}ms`);
   }
 
   const headers = { ...req.headers } as Record<string, string>;
@@ -491,7 +558,7 @@ function forwardRequest(
     if (meta) {
       const elapsed = Date.now() - meta.reqStart;
       log(
-        `[阶段] 上游响应 ${req.method} ${pathOnly} -> ${upstreamUrl} status=${status} body=${meta.origSizeKB}KB ${meta.hasImage ? "有图" : "无图"} 首包耗时=${elapsed}ms`
+        `${requestLabel(meta.requestId)} [阶段] 上游响应 ${req.method} ${pathOnly} -> ${upstreamUrl} status=${status} body=${meta.origSizeKB}KB ${meta.hasImage ? "有图" : "无图"} 首包耗时=${elapsed}ms`
       );
     }
     if (res.destroyed) {
@@ -508,7 +575,7 @@ function forwardRequest(
     }
     if (meta) {
       const elapsed = Date.now() - meta.reqStart;
-      log(`[image-proxy] 转发失败 ${req.method} ${pathOnly} -> ${upstreamUrl} (耗时=${elapsed}ms): ${err.message}`);
+      log(`${requestLabel(meta.requestId)} [image-proxy] 转发失败 ${req.method} ${pathOnly} -> ${upstreamUrl} (耗时=${elapsed}ms): ${err.message}`);
     } else {
       log(`[image-proxy] 转发失败 ${req.method} ${pathOnly} -> ${upstreamUrl}: ${err.message}`);
     }
@@ -613,6 +680,7 @@ export function startImageProxy(): Promise<void> {
     process.on("exit", releaseOnExit);
 
     const server = http.createServer(async (req, res) => {
+      const requestId = nextRequestId++;
       const reqStart = Date.now();
       // Claude Code 中断/重试时立即取消本轮代理工作，避免旧请求继续占用
       // 视觉模型 调用或上游流式连接。
@@ -632,10 +700,11 @@ export function startImageProxy(): Promise<void> {
       const isMessagesEndpoint =
         req.method === "POST" && (req.url || "").includes("/v1/messages");
       const pathOnly = (req.url || "").split("?")[0];
-      log(`[阶段] 接收 ${req.method} ${pathOnly}`);
+      log(`${requestLabel(requestId)} [阶段] 接收 ${req.method} ${pathOnly}`);
 
       if (!isMessagesEndpoint) {
         forwardRequest(req, res, null, {
+          requestId,
           reqStart,
           hasImage: false,
           origSizeKB: "?",
@@ -649,7 +718,7 @@ export function startImageProxy(): Promise<void> {
         const buffer = Buffer.concat(chunks);
         const contentEncoding = (req.headers["content-encoding"] || "").toLowerCase();
         log(
-          `[阶段] body读取完成 ${req.method} ${pathOnly} size=${(buffer.length / 1024).toFixed(1)}KB encoding=${contentEncoding || "none"} elapsed=${Date.now() - reqStart}ms`
+          `${requestLabel(requestId)} [阶段] body读取完成 ${req.method} ${pathOnly} size=${(buffer.length / 1024).toFixed(1)}KB encoding=${contentEncoding || "none"} elapsed=${Date.now() - reqStart}ms`
         );
 
         // 解压请求体（支持 gzip / deflate / br），否则 JSON.parse 会失败
@@ -665,10 +734,10 @@ export function startImageProxy(): Promise<void> {
             rawBody = buffer.toString("utf8");
           }
           log(
-            `[阶段] body解码完成 ${req.method} ${pathOnly} rawSize=${(Buffer.byteLength(rawBody) / 1024).toFixed(1)}KB elapsed=${Date.now() - reqStart}ms`
+            `${requestLabel(requestId)} [阶段] body解码完成 ${req.method} ${pathOnly} rawSize=${(Buffer.byteLength(rawBody) / 1024).toFixed(1)}KB elapsed=${Date.now() - reqStart}ms`
           );
         } catch (err) {
-          log(`[image-proxy] 请求体解压失败: ${(err as Error).message}`);
+          log(`${requestLabel(requestId)} [image-proxy] 请求体解压失败: ${(err as Error).message}`);
           if (!res.headersSent) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(
@@ -683,8 +752,9 @@ export function startImageProxy(): Promise<void> {
         try {
           const origSizeKB = (Buffer.byteLength(rawBody) / 1024).toFixed(1);
           if (!mayContainImagePayload(rawBody)) {
-            log(`[阶段] 无图快速转发 ${req.method} ${pathOnly} elapsed=${Date.now() - reqStart}ms`);
+            log(`${requestLabel(requestId)} [阶段] 无图快速转发 ${req.method} ${pathOnly} elapsed=${Date.now() - reqStart}ms`);
             forwardRequest(req, res, rawBody, {
+              requestId,
               reqStart,
               hasImage: false,
               origSizeKB,
@@ -693,7 +763,7 @@ export function startImageProxy(): Promise<void> {
           }
 
           const requestData = JSON.parse(rawBody);
-          log(`[阶段] JSON解析完成 ${req.method} ${pathOnly} elapsed=${Date.now() - reqStart}ms`);
+          log(`${requestLabel(requestId)} [阶段] JSON解析完成 ${req.method} ${pathOnly} elapsed=${Date.now() - reqStart}ms`);
           let hasImage = false;
           if (Array.isArray(requestData.messages)) {
             for (const msg of requestData.messages) {
@@ -703,18 +773,20 @@ export function startImageProxy(): Promise<void> {
           }
 
           if (hasImage) {
-            log(`[image-proxy] 检测到图片，开始识别...`);
-            requestData.messages = await processMessages(requestData.messages, requestController.signal);
-            log(`[阶段] 图片处理完成 ${req.method} ${pathOnly} elapsed=${Date.now() - reqStart}ms`);
-            logForwardedImageTexts(requestData.messages);
+            log(`${requestLabel(requestId)} [image-proxy] 检测到图片，开始识别...`);
+            requestData.messages = await processMessages(requestData.messages, requestController.signal, requestId);
+            log(`${requestLabel(requestId)} [阶段] 图片处理完成 ${req.method} ${pathOnly} elapsed=${Date.now() - reqStart}ms`);
+            logForwardedImageTexts(requestData.messages, requestId);
             const newBody = JSON.stringify(requestData);
             forwardRequest(req, res, newBody, {
+              requestId,
               reqStart,
               hasImage: true,
               origSizeKB,
             }, requestController.signal);
           } else {
             forwardRequest(req, res, rawBody, {
+              requestId,
               reqStart,
               hasImage: false,
               origSizeKB,
@@ -724,7 +796,7 @@ export function startImageProxy(): Promise<void> {
           if (requestController.signal.aborted || isCanceledError(err)) {
             return;
           }
-          log(`[image-proxy] 处理失败: ${(err as Error).message}`);
+          log(`${requestLabel(requestId)} [image-proxy] 处理失败: ${(err as Error).message}`);
           if (!res.headersSent) {
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(
@@ -737,7 +809,7 @@ export function startImageProxy(): Promise<void> {
       });
 
       req.on("error", (err: Error) => {
-        log(`[image-proxy] 请求错误: ${err.message}`);
+        log(`${requestLabel(requestId)} [image-proxy] 请求错误: ${err.message}`);
       });
     });
 
@@ -758,6 +830,7 @@ export function startImageProxy(): Promise<void> {
     server.listen(PROXY_PORT, "127.0.0.1", () => {
       log(`[image-proxy] 代理已启动: http://127.0.0.1:${PROXY_PORT} (pid ${process.pid})`);
       log(`[image-proxy] 上游 API: ${UPSTREAM_BASE_URL}`);
+      log(`[image-proxy] 识图模式: ${IMAGE_DESC_PROMPT ? "custom IMAGE_DESC_PROMPT" : DEFAULT_IMAGE_DESC_MODE}, max_tokens=${DEFAULT_MAX_TOKENS}`);
       resolve();
     });
   });

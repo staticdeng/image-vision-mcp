@@ -3,6 +3,7 @@ import { DescribeImageInputSchema } from "../schemas.js";
 import { DEFAULT_MODEL, CHARACTER_LIMIT } from "../constants.js";
 import { loadImageAsDataUrl } from "../services/image.js";
 import { callVision, handleVisionError } from "../services/vision.js";
+import { buildImageDescriptionPrompt } from "../prompts.js";
 import type { DescribeImageInput } from "../schemas.js";
 import type { VisionContent, VisionMessage } from "../types.js";
 
@@ -22,17 +23,20 @@ Args:
   - image (string, 必填): 图片路径或 URL。
     - 本地路径示例: "C:/Users/user/screenshot.png" 或 "/tmp/img.jpg"
     - URL 示例: "https://example.com/img.png"
-  - prompt (string, 可选): 询问图片的问题或识图指令，默认 "请详细描述这张图片的内容。"。最长 4000 字符
-  - max_tokens (number, 可选): 返回描述的最大 token 数，1-8192，默认 2048
+  - prompt (string, 可选): 额外识图指令，会附加到当前 mode 的提示词模板后；不传则仅使用模式模板（默认 auto 自动分类）。最长 4000 字符
+  - mode (string, 可选): auto / design_rebuild / prototype_understanding / bug_screenshot / general，默认 auto
+  - max_tokens (number, 可选): 返回描述的最大 token 数，1-8192，默认由 VISION_MAX_TOKENS 控制，未设置为 2048
 
 Returns:
-  文本内容，包含图片描述和 token 使用情况元信息。
+  文本内容。默认会先自动判断图片类型，再输出适合设计图还原、原型图理解或 bug 截图分析的结构化结果，并附带 token 使用情况元信息。
 
 Examples:
   - 描述本地截图: image="C:/Users/user/screenshot.png"
-  - 描述网络图片: image="https://example.com/chart.png", prompt="图表中显示的数据是什么"
+  - 还原设计图: image="C:/Users/user/design.png", mode="design_rebuild"
+  - 理解原型图: image="C:/Users/user/prototype.png", mode="prototype_understanding"
+  - 分析测试截图: image="C:/Users/user/bug.png", mode="bug_screenshot"
   - 提取文字 (OCR): image="C:/Users/user/document.jpg", prompt="请提取图片中的所有文字"
-  - 识别物体: image="C:/Users/user/photo.jpg", prompt="图片里有哪些物体"
+  - 普通识图: image="C:/Users/user/photo.jpg", mode="general", prompt="图片里有哪些物体"
 
 Error Handling:
   - "无法访问本地文件": 文件路径错误或无权限
@@ -66,9 +70,10 @@ Error Handling:
       }
 
       // 2. 构造视觉模型请求
+      const visionPrompt = buildImageDescriptionPrompt(params.mode, params.prompt);
       const content: VisionContent[] = [
         { type: "image_url", image_url: { url: imageResult.dataUrl } },
-        { type: "text", text: params.prompt },
+        { type: "text", text: visionPrompt },
       ];
       const messages: VisionMessage[] = [{ role: "user", content }];
 
@@ -103,6 +108,7 @@ Error Handling:
       // 5. 构造输出
       const meta = [
         `模型: ${response.model}`,
+        `识图模式: ${params.mode}`,
         `图片大小: ${(imageResult.sizeBytes / 1024).toFixed(2)} KB (${imageResult.mimeType})`,
         `Token 使用: ${response.usage?.total_tokens ?? "未知"} (prompt: ${response.usage?.prompt_tokens ?? "?"}, completion: ${response.usage?.completion_tokens ?? "?"})`,
       ].join("\n");
