@@ -601,6 +601,55 @@ function forwardRequest(
 // 锁文件路径：系统临时目录，跨平台无需权限处理
 const LOCK_FILE = path.join(os.tmpdir(), "vision-mcp-proxy.lock");
 
+interface ProxyLockInfo {
+  pid: number;
+  scriptMtimeMs?: number;
+  createdAt?: string;
+}
+
+function getProxyScriptMtimeMs(): number {
+  try {
+    return fs.statSync(STANDALONE_SCRIPT).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function createLockInfo(): ProxyLockInfo {
+  return {
+    pid: process.pid,
+    scriptMtimeMs: getProxyScriptMtimeMs(),
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function readProxyLockInfo(): ProxyLockInfo | null {
+  try {
+    const raw = fs.readFileSync(LOCK_FILE, "utf8").trim();
+    if (!raw) return null;
+    if (raw.startsWith("{")) {
+      const parsed = JSON.parse(raw) as Partial<ProxyLockInfo>;
+      return typeof parsed.pid === "number" && parsed.pid > 0
+        ? parsed as ProxyLockInfo
+        : null;
+    }
+    const legacyPid = parseInt(raw, 10);
+    return Number.isFinite(legacyPid) && legacyPid > 0
+      ? { pid: legacyPid }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function removeLockFile(): void {
+  try {
+    fs.unlinkSync(LOCK_FILE);
+  } catch {
+    // 锁文件可能已被其他进程清理。
+  }
+}
+
 // 检测 PID 对应的进程是否仍在运行（信号 0 不实际发信号，仅探测存活）
 function isProcessAlive(pid: number): boolean {
   try {
@@ -612,6 +661,43 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function waitForProcessExit(pid: number, timeoutMs = 2000): boolean {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (!isProcessAlive(pid)) return true;
+    sleepSync(100);
+  }
+  return !isProcessAlive(pid);
+}
+
+function stopProxyProcess(pid: number, reason: string): boolean {
+  if (pid === process.pid) return false;
+  try {
+    log(`[image-proxy] 正在停止旧代理 pid ${pid}: ${reason}`);
+    process.kill(pid, "SIGTERM");
+  } catch {
+    return !isProcessAlive(pid);
+  }
+  if (waitForProcessExit(pid)) {
+    return true;
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    return !isProcessAlive(pid);
+  }
+  return waitForProcessExit(pid);
+}
+
+function isProxyLockCurrent(lockInfo: ProxyLockInfo): boolean {
+  if (lockInfo.scriptMtimeMs === undefined) return false;
+  return Math.abs(lockInfo.scriptMtimeMs - getProxyScriptMtimeMs()) < 1;
+}
+
 // 尝试获取单例锁：保证全局只有一个 vision-mcp 进程启动图片代理，
 // 避免多个 MCP 进程互相 kill 对方占用的 8787 端口（会把正在处理请求的代理杀掉）。
 // 返回 true 表示拿到锁、应由本进程启动代理；false 表示已有代理在运行，跳过。
@@ -619,7 +705,7 @@ function tryAcquireLock(): boolean {
   try {
     // O_EXCL (wx) 原子创建：文件已存在则抛 EEXIST
     const fd = fs.openSync(LOCK_FILE, "wx");
-    fs.writeFileSync(fd, String(process.pid));
+    fs.writeFileSync(fd, JSON.stringify(createLockInfo()));
     fs.closeSync(fd);
     return true;
   } catch (err) {
@@ -629,12 +715,23 @@ function tryAcquireLock(): boolean {
     }
     // 锁文件已存在：检查持有者是否还活着
     try {
-      const holderPid = parseInt(fs.readFileSync(LOCK_FILE, "utf8").trim(), 10);
-      if (holderPid && isProcessAlive(holderPid)) {
-        return false; // 持有者仍存活，复用已有代理
+      const lockInfo = readProxyLockInfo();
+      if (!lockInfo) {
+        removeLockFile();
+        return tryAcquireLock();
+      }
+      if (isProcessAlive(lockInfo.pid)) {
+        if (isProxyLockCurrent(lockInfo)) {
+          return false; // 持有者仍存活且脚本版本匹配，复用已有代理
+        }
+        if (!stopProxyProcess(lockInfo.pid, "代理脚本已更新")) {
+          return false;
+        }
+        removeLockFile();
+        return tryAcquireLock();
       }
       // 持有者已退出（崩溃未释放锁）：清理僵尸锁后递归重试
-      fs.unlinkSync(LOCK_FILE);
+      removeLockFile();
       return tryAcquireLock();
     } catch {
       return false;
@@ -645,9 +742,9 @@ function tryAcquireLock(): boolean {
 // 释放锁：仅当锁文件登记的 PID 是本进程时才删除，避免误删他人的锁
 function releaseLock(): void {
   try {
-    const holderPid = parseInt(fs.readFileSync(LOCK_FILE, "utf8").trim(), 10);
-    if (holderPid === process.pid) {
-      fs.unlinkSync(LOCK_FILE);
+    const lockInfo = readProxyLockInfo();
+    if (lockInfo?.pid === process.pid) {
+      removeLockFile();
     }
   } catch {
     // 忽略：文件可能已被删除
@@ -843,20 +940,20 @@ const STANDALONE_SCRIPT = fileURLToPath(
   new URL("standaloneProxy.js", import.meta.url)
 );
 
-// 读取锁文件里登记的代理 PID；不存在/无效返回 null
-function readLockHolderPid(): number | null {
-  try {
-    const pid = parseInt(fs.readFileSync(LOCK_FILE, "utf8").trim(), 10);
-    return Number.isFinite(pid) && pid > 0 ? pid : null;
-  } catch {
-    return null;
-  }
-}
-
-// MCP 进程调用：确保有一个独立常驻的图片代理在运行。
-// - 锁持有者进程存活 → 复用已有代理
-// - 否则 detached spawn 一个独立代理进程，与本 MCP 进程生命周期解耦
-// 任何一个 Claude Code 会话退出都不影响代理，代理常驻至自身崩溃或被主动 kill。
+/**
+ * MCP 启动/重连时的代理协调器。
+ *
+ * 代理本身以 detached 子进程常驻，和当前 MCP 会话解耦：
+ * 全局只保留一个 HTTP 图片代理，避免多个 Claude Code 会话抢占同一端口。
+ * 关闭某个 Claude Code 会话不会停止代理，后续会话可以继续复用同一个端口。
+ *
+ * 锁文件用于记录当前代理 PID 和 standaloneProxy.js 的构建时间戳。
+ * 当 npm run build 更新了 dist/proxy/standaloneProxy.js 后，下一次 MCP 重连会
+ * 发现锁里的 scriptMtimeMs 已过期，自动停止旧代理、删除旧锁并拉起新代理。
+ *
+ * 旧版锁文件只包含 PID，没有脚本版本信息；这类锁会被视为版本未知，
+ * 在 MCP 重连时允许自动接管，避免开发时手动 taskkill 和删除 lock。
+ */
 export function ensureImageProxyRunning(): Promise<void> {
   return new Promise((resolve) => {
     if (!UPSTREAM_BASE_URL) {
@@ -865,15 +962,26 @@ export function ensureImageProxyRunning(): Promise<void> {
       return;
     }
 
-    // 1. 已有独立代理在运行则直接复用
-    const holderPid = readLockHolderPid();
-    if (holderPid !== null && isProcessAlive(holderPid)) {
-      log(`[image-proxy] 独立代理已在运行 (pid ${holderPid})，复用`);
-      resolve();
-      return;
+    // 1. 处理已有锁：复用仍然有效的代理，或接管过期/僵尸代理。
+    const lockInfo = readProxyLockInfo();
+    if (lockInfo !== null && isProcessAlive(lockInfo.pid)) {
+      if (isProxyLockCurrent(lockInfo)) {
+        log(`[image-proxy] 独立代理已在运行 (pid ${lockInfo.pid})，复用`);
+        resolve();
+        return;
+      }
+      if (stopProxyProcess(lockInfo.pid, "MCP 重连时检测到代理脚本已更新")) {
+        removeLockFile();
+      } else {
+        log(`[image-proxy] 旧代理仍在运行 (pid ${lockInfo.pid})，放弃自动重启（MCP 工具仍可用）`);
+        resolve();
+        return;
+      }
+    } else if (lockInfo !== null) {
+      removeLockFile();
     }
 
-    // 2. detached spawn 独立代理进程：stdio ignore + unref，独立于父进程生命周期
+    // 2. 无可复用代理时，拉起新的 detached 代理进程。
     try {
       const child = spawn(process.execPath, [STANDALONE_SCRIPT], {
         detached: true,

@@ -122,6 +122,21 @@ function summarizeContent(content: string | VisionContent[]): unknown {
   });
 }
 
+function summarizeVisionResponse(response: VisionChatResponse): unknown {
+  return {
+    id: response.id,
+    model: response.model,
+    choices: response.choices?.map((choice) => ({
+      index: choice.index,
+      finish_reason: choice.finish_reason,
+      message_role: choice.message?.role,
+      content_chars: choice.message?.content?.length ?? 0,
+      content_preview: choice.message?.content?.slice(0, 160) ?? "",
+    })) ?? [],
+    usage: response.usage,
+  };
+}
+
 // 重试退避也要响应取消，否则客户端已经中断时还会继续占着任务。
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
@@ -175,6 +190,7 @@ export async function callVision(params: CallVisionParams): Promise<VisionChatRe
           },
         }
       );
+      logVision(`[Vision] response ${JSON.stringify(summarizeVisionResponse(response.data))}`);
       return response.data;
     } catch (err) {
       lastError = err;
