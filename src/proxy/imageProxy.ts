@@ -25,7 +25,7 @@ import {
 
 // ────────────────────── 日志 ──────────────────────
 
-// 日志文件路径：优先用环境变量，否则放项目内 logs/ 目录。
+// 日志文件路径：放项目内 logs/ 目录。
 // 用 import.meta.url 定位 dist/proxy/ → 反推项目根：独立代理进程是 detached
 // spawn 的，cwd 不可靠（可能继承自任意 Claude Code 会话），只能用脚本自身位置定位。
 const PROJECT_ROOT = path.resolve(
@@ -33,12 +33,10 @@ const PROJECT_ROOT = path.resolve(
   "..",
   ".."
 );
-const LOG_FILE =
-  process.env.VISION_MCP_LOG_FILE ||
-  path.join(PROJECT_ROOT, "logs", "vision-mcp-proxy.log");
+const LOG_FILE = path.join(PROJECT_ROOT, "logs", "vision-mcp-proxy.log");
 const LOG_MAX_SIZE = 10 * 1024 * 1024; // 10MB，超过后清空旧日志
 
-// 确保日志目录存在（环境变量覆盖到自定义路径时同样需要）。同步创建一次即可，
+// 确保日志目录存在。同步创建一次即可，
 // 失败也不影响代理功能——后续 appendFile 会静默失败，请求转发不受影响。
 try {
   fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
@@ -70,13 +68,52 @@ function log(msg: string): void {
 
 // ────────────────────── 配置 ──────────────────────
 
+// 集中读取并归一化代理协调器使用的配置。启动判断、锁写入和配置指纹都使用该对象，
+// 避免多处独立读取 env 导致归一化规则漂移。归一化规则必须与请求处理代码的实际读取规则一致。
+interface EffectiveProxyConfig {
+  visionApiKey: string;
+  visionBaseUrl: string;
+  visionModel: string;
+  upstreamBaseUrl: string;
+  proxyBaseUrl: string;
+  imageDescMode: string;
+  imageDescPrompt: string;
+}
+
+function getEffectiveProxyConfig(): EffectiveProxyConfig {
+  return {
+    visionApiKey: process.env.VISION_API_KEY || "",
+    visionBaseUrl: process.env.VISION_BASE_URL?.replace(/\/+$/, "") || "",
+    visionModel: process.env.VISION_MODEL || "",
+    upstreamBaseUrl: process.env.UPSTREAM_BASE_URL || "",
+    proxyBaseUrl: process.env.ANTHROPIC_BASE_URL || "",
+    imageDescMode: DEFAULT_IMAGE_DESC_MODE,
+    imageDescPrompt: process.env.IMAGE_DESC_PROMPT?.trim() || "",
+  };
+}
+
+// 配置指纹：用于检测代理依赖的配置是否变化，变化则在 MCP 重连时停旧拉新。
+// 用有序二元组数组序列化后 sha256，避免无边界字符串拼接的歧义；锁文件只存哈希，不落 env 明文。
+function getProxyConfigFingerprint(): string {
+  const config = getEffectiveProxyConfig();
+  const entries: ReadonlyArray<readonly [string, string]> = [
+    ["visionApiKey", config.visionApiKey],
+    ["visionBaseUrl", config.visionBaseUrl],
+    ["visionModel", config.visionModel],
+    ["upstreamBaseUrl", config.upstreamBaseUrl],
+    ["proxyBaseUrl", config.proxyBaseUrl],
+    ["imageDescMode", config.imageDescMode],
+    ["imageDescPrompt", config.imageDescPrompt],
+  ];
+  return crypto.createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+}
+
 // 代理监听端口：从 ANTHROPIC_BASE_URL 解析，与 Claude Code 端保持一致
 // 没设 ANTHROPIC_BASE_URL 时用默认 8787（纯 MCP 工具模式，代理无人连接）
-function getProxyPort(): number {
-  const baseUrl = process.env.ANTHROPIC_BASE_URL;
-  if (baseUrl) {
+function getProxyPort(proxyBaseUrl: string): number {
+  if (proxyBaseUrl) {
     try {
-      const port = new URL(baseUrl).port;
+      const port = new URL(proxyBaseUrl).port;
       if (port) return parseInt(port, 10);
     } catch {
       // 忽略解析错误，回退到默认
@@ -84,14 +121,12 @@ function getProxyPort(): number {
   }
   return 8787;
 }
-const PROXY_PORT = getProxyPort();
+
+const EFFECTIVE_CONFIG = getEffectiveProxyConfig();
 // 代理转发目标：用户必须设置 UPSTREAM_BASE_URL，否则代理功能不可用（MCP 工具仍可用）
-const UPSTREAM_BASE_URL = process.env.UPSTREAM_BASE_URL || "";
-const UPSTREAM_AUTH_TOKEN =
-  process.env.UPSTREAM_AUTH_TOKEN ||
-  process.env.ANTHROPIC_AUTH_TOKEN ||
-  "";
-const IMAGE_DESC_PROMPT = process.env.IMAGE_DESC_PROMPT?.trim();
+const UPSTREAM_BASE_URL = EFFECTIVE_CONFIG.upstreamBaseUrl;
+const IMAGE_DESC_PROMPT = EFFECTIVE_CONFIG.imageDescPrompt;
+const PROXY_PORT = getProxyPort(EFFECTIVE_CONFIG.proxyBaseUrl);
 
 // 复用到上游模型的连接，减少慢流式响应场景下频繁建连的额外开销。
 const upstreamHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
@@ -568,10 +603,6 @@ function forwardRequest(
   const headers = { ...req.headers } as Record<string, string>;
   delete headers["host"];
   headers["host"] = baseUrl.host;
-  if (UPSTREAM_AUTH_TOKEN) {
-    headers["authorization"] = `Bearer ${UPSTREAM_AUTH_TOKEN}`;
-    headers["x-api-key"] = UPSTREAM_AUTH_TOKEN;
-  }
 
   if (body !== null) {
     delete headers["content-length"];
@@ -642,6 +673,7 @@ const LOCK_FILE = path.join(os.tmpdir(), "vision-mcp-proxy.lock");
 interface ProxyLockInfo {
   pid: number;
   scriptMtimeMs?: number;
+  configHash?: string;
   createdAt?: string;
 }
 
@@ -657,6 +689,7 @@ function createLockInfo(): ProxyLockInfo {
   return {
     pid: process.pid,
     scriptMtimeMs: getProxyScriptMtimeMs(),
+    configHash: getProxyConfigFingerprint(),
     createdAt: new Date().toISOString(),
   };
 }
@@ -731,9 +764,34 @@ function stopProxyProcess(pid: number, reason: string): boolean {
   return waitForProcessExit(pid);
 }
 
+// 诊断锁过期原因：脚本变了 / 配置变了 / 都变。用于选择 stopProxyProcess 的 reason 文案，
+// 因为 isProxyLockCurrent() 只返回 boolean，无法告知是哪一项不一致。
+function diagnoseLockStaleness(lockInfo: ProxyLockInfo): {
+  scriptChanged: boolean;
+  configChanged: boolean;
+} {
+  const scriptChanged =
+    lockInfo.scriptMtimeMs === undefined ||
+    Math.abs(lockInfo.scriptMtimeMs - getProxyScriptMtimeMs()) >= 1;
+  const configChanged =
+    lockInfo.configHash === undefined ||
+    lockInfo.configHash !== getProxyConfigFingerprint();
+  return { scriptChanged, configChanged };
+}
+
+function stalenessReason(staleness: {
+  scriptChanged: boolean;
+  configChanged: boolean;
+}): string {
+  if (staleness.scriptChanged && staleness.configChanged) return "代理脚本与配置已更新";
+  if (staleness.scriptChanged) return "代理脚本已更新";
+  if (staleness.configChanged) return "代理配置已更新";
+  return "代理需重启";
+}
+
 function isProxyLockCurrent(lockInfo: ProxyLockInfo): boolean {
-  if (lockInfo.scriptMtimeMs === undefined) return false;
-  return Math.abs(lockInfo.scriptMtimeMs - getProxyScriptMtimeMs()) < 1;
+  const staleness = diagnoseLockStaleness(lockInfo);
+  return !staleness.scriptChanged && !staleness.configChanged;
 }
 
 // 尝试获取单例锁：保证全局只有一个 vision-mcp 进程启动图片代理，
@@ -762,7 +820,7 @@ function tryAcquireLock(): boolean {
         if (isProxyLockCurrent(lockInfo)) {
           return false; // 持有者仍存活且脚本版本匹配，复用已有代理
         }
-        if (!stopProxyProcess(lockInfo.pid, "代理脚本已更新")) {
+        if (!stopProxyProcess(lockInfo.pid, stalenessReason(diagnoseLockStaleness(lockInfo)))) {
           return false;
         }
         removeLockFile();
@@ -997,24 +1055,38 @@ const STANDALONE_SCRIPT = fileURLToPath(
  */
 export function ensureImageProxyRunning(): Promise<void> {
   return new Promise((resolve) => {
-    if (!UPSTREAM_BASE_URL) {
-      log("[image-proxy] 未设置 UPSTREAM_BASE_URL，代理功能不可用（MCP 工具仍可用）");
+    const upstreamEnabled = !!getEffectiveProxyConfig().upstreamBaseUrl;
+    const lockInfo = readProxyLockInfo();
+    const oldAlive = lockInfo !== null && isProcessAlive(lockInfo.pid);
+
+    // 0. 新配置禁用代理：若旧代理仍存活则停止并清理锁，不拉起新代理。
+    //    避免 UPSTREAM_BASE_URL 被删除后旧代理继续向旧上游常驻转发。
+    if (!upstreamEnabled) {
+      if (oldAlive) {
+        log("[image-proxy] UPSTREAM_BASE_URL 未设置，停止旧代理并禁用代理功能（MCP 工具仍可用）");
+        if (stopProxyProcess(lockInfo!.pid, "代理已被禁用（UPSTREAM_BASE_URL 未设置）")) {
+          removeLockFile();
+        }
+      } else if (lockInfo !== null) {
+        removeLockFile();
+      } else {
+        log("[image-proxy] 未设置 UPSTREAM_BASE_URL，代理功能不可用（MCP 工具仍可用）");
+      }
       resolve();
       return;
     }
 
-    // 1. 处理已有锁：复用仍然有效的代理，或接管过期/僵尸代理。
-    const lockInfo = readProxyLockInfo();
-    if (lockInfo !== null && isProcessAlive(lockInfo.pid)) {
-      if (isProxyLockCurrent(lockInfo)) {
-        log(`[image-proxy] 独立代理已在运行 (pid ${lockInfo.pid})，复用`);
+    // 1. 处理已有锁：复用仍然有效的代理，或停旧拉新。
+    if (oldAlive) {
+      if (isProxyLockCurrent(lockInfo!)) {
+        log(`[image-proxy] 独立代理已在运行 (pid ${lockInfo!.pid})，复用`);
         resolve();
         return;
       }
-      if (stopProxyProcess(lockInfo.pid, "MCP 重连时检测到代理脚本已更新")) {
+      if (stopProxyProcess(lockInfo!.pid, stalenessReason(diagnoseLockStaleness(lockInfo!)))) {
         removeLockFile();
       } else {
-        log(`[image-proxy] 旧代理仍在运行 (pid ${lockInfo.pid})，放弃自动重启（MCP 工具仍可用）`);
+        log(`[image-proxy] 旧代理仍在运行 (pid ${lockInfo!.pid})，放弃自动重启（MCP 工具仍可用）`);
         resolve();
         return;
       }

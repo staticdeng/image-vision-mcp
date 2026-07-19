@@ -15,9 +15,7 @@ const PROJECT_ROOT = path.resolve(
   "..",
   ".."
 );
-const LOG_FILE =
-  process.env.VISION_MCP_LOG_FILE ||
-  path.join(PROJECT_ROOT, "logs", "vision-mcp-proxy.log");
+const LOG_FILE = path.join(PROJECT_ROOT, "logs", "vision-mcp-proxy.log");
 const LOG_MAX_SIZE = 10 * 1024 * 1024;
 
 try {

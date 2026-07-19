@@ -115,7 +115,7 @@ After restarting Claude Code, tell Claude "describe C:/xxx.png" and it will call
 
 #### Setup steps
 
-**Step 1**: Edit `~/.claude.json` to configure the MCP server (add `UPSTREAM_BASE_URL` on top of the basic config):
+**Step 1**: Edit `~/.claude.json` to configure the MCP server:
 
 ```json
 {
@@ -126,8 +126,7 @@ After restarting Claude Code, tell Claude "describe C:/xxx.png" and it will call
       "env": {
         "VISION_API_KEY": "your-vision-model-api-key",
         "VISION_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
-        "VISION_MODEL": "doubao-seed-2-1-turbo-260628",
-        "UPSTREAM_BASE_URL": "https://your-upstream-llm-api-endpoint"
+        "VISION_MODEL": "doubao-seed-2-1-turbo-260628"
       }
     }
   }
@@ -147,8 +146,8 @@ After restarting Claude Code, tell Claude "describe C:/xxx.png" and it will call
 ```
 
 > The two `env` blocks serve different purposes:
-> - `~/.claude/settings.json` `env`: read by Claude Code itself (routing through the proxy + upstream auth)
-> - `~/.claude.json` `mcpServers.vision-mcp.env`: read by the MCP server process (vision-model key + upstream text-model request endpoint)
+> - `~/.claude/settings.json` top-level `env`: read by Claude Code itself and inherited by the proxy. `ANTHROPIC_BASE_URL` (routing), `ANTHROPIC_AUTH_TOKEN` (upstream auth) and `UPSTREAM_BASE_URL` (upstream LLM endpoint) must live **only** here, not in `mcpServers.env`.
+> - `~/.claude.json` `mcpServers.vision-mcp.env`: read by the MCP server process
 
 **Step 3**: Restart Claude Code, then `Ctrl+V` paste images directly.
 
@@ -159,14 +158,13 @@ After restarting Claude Code, tell Claude "describe C:/xxx.png" and it will call
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `ANTHROPIC_BASE_URL` | Yes | `http://127.0.0.1:8787`; the proxy parses its listen port from this URL |
-| `ANTHROPIC_AUTH_TOKEN` | Yes | Auth token for the upstream LLM API; reused by the proxy when forwarding |
+| `ANTHROPIC_AUTH_TOKEN` | Yes | Auth token for the upstream LLM API; Claude Code sends it in request headers, which the proxy forwards as-is |
+| `UPSTREAM_BASE_URL` | Yes | Upstream LLM API endpoint. If unset, the proxy does not start (the MCP tool still works) |
 
 **MCP server side** (`~/.claude.json` `mcpServers.vision-mcp.env`):
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `UPSTREAM_BASE_URL` | Yes | - | Upstream LLM API endpoint. If unset, the proxy does not start (the MCP tool still works) |
-| `UPSTREAM_AUTH_TOKEN` | No | Taken from `ANTHROPIC_AUTH_TOKEN` | Upstream auth token |
 | `VISION_API_KEY` | Yes | - | Vision-model API key (shared by the MCP tool and the proxy) |
 | `VISION_BASE_URL` | Yes | - | Vision-model API endpoint (see the supported-platform table) |
 | `VISION_MODEL` | Yes | - | Vision-model ID (see the supported-platform table) |
@@ -174,6 +172,17 @@ After restarting Claude Code, tell Claude "describe C:/xxx.png" and it will call
 | `IMAGE_DESC_PROMPT` | No | Built-in auto-classification prompt | Fully overrides the proxy's image-description prompt. When set, the `IMAGE_DESC_MODE` built-in template is not used |
 | `ALLOW_PRIVATE_NETWORK_IMAGES` | No | - | Set to `1` or `true` to allow internal/private-network image URLs (denied by default to prevent SSRF) |
 
+
+#### Reloading configuration
+
+The MCP server process and the image proxy have different lifecycles, so configuration changes take effect through different actions:
+
+| Change | How to apply |
+|--------|--------------|
+| `~/.claude.json` `mcpServers.vision-mcp.env` (e.g. `VISION_MODEL`, `IMAGE_DESC_MODE`) | Reconnect the MCP server (`/mcp` reconnect) -- no Claude Code restart needed |
+| `~/.claude/settings.json` top-level `env` (e.g. `UPSTREAM_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`) | Restart Claude Code |
+
+The image proxy is a standalone persistent process. On MCP reconnect, it detects config changes via a fingerprint (sha256 of `VISION_API_KEY`, `VISION_BASE_URL`, `VISION_MODEL`, `UPSTREAM_BASE_URL`, `ANTHROPIC_BASE_URL`, `IMAGE_DESC_MODE`, `IMAGE_DESC_PROMPT`) and automatically restarts the old proxy with the new config -- no manual kill or rebuild needed for config-only changes.
 
 ## Usage Examples
 

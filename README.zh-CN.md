@@ -114,7 +114,7 @@ MCP 工具和代理共享同一进程、同一份视觉模型配置，启动 MCP
 
 #### 配置步骤
 
-**第 1 步**：编辑 `~/.claude.json`，配置 MCP server（在基础配置基础上加 `UPSTREAM_BASE_URL`）：
+**第 1 步**：编辑 `~/.claude.json`，配置 MCP server：
 
 ```json
 {
@@ -125,8 +125,7 @@ MCP 工具和代理共享同一进程、同一份视觉模型配置，启动 MCP
       "env": {
         "VISION_API_KEY": "你的视觉模型-api-key",
         "VISION_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
-        "VISION_MODEL": "doubao-seed-2-1-turbo-260628",
-        "UPSTREAM_BASE_URL": "https://你的上游-llm-api-地址"
+        "VISION_MODEL": "doubao-seed-2-1-turbo-260628"
       }
     }
   }
@@ -146,8 +145,8 @@ MCP 工具和代理共享同一进程、同一份视觉模型配置，启动 MCP
 ```
 
 > 两处 `env` 作用不同：
-> - `~/.claude/settings.json` 的 `env`：Claude Code 自身读取（走代理 + 上游认证）
-> - `~/.claude.json` 里 `mcpServers.vision-mcp.env`：MCP server 进程读取（视觉模型 key + 上游纯文本模型请求地址）
+> - `~/.claude/settings.json` 顶层 `env`：Claude Code 自身读取、代理继承。`ANTHROPIC_BASE_URL`（走代理）、`ANTHROPIC_AUTH_TOKEN`（上游认证）和 `UPSTREAM_BASE_URL`（上游 LLM 地址）**只能**放在这里，不要写到 `mcpServers.env`。
+> - `~/.claude.json` 里 `mcpServers.vision-mcp.env`：MCP server 进程读取
 
 **第 3 步**：重启 Claude Code，直接 `Ctrl+V` 粘贴图片即可。
 
@@ -158,14 +157,13 @@ MCP 工具和代理共享同一进程、同一份视觉模型配置，启动 MCP
 | 环境变量 | 必填 | 说明 |
 |---------|------|------|
 | `ANTHROPIC_BASE_URL` | 是 | `http://127.0.0.1:8787`，代理监听端口从该 URL 解析 |
-| `ANTHROPIC_AUTH_TOKEN` | 是 | 上游 LLM API 的认证 token，代理转发时复用 |
+| `ANTHROPIC_AUTH_TOKEN` | 是 | 上游 LLM API 的认证 token，Claude Code 在请求头里发送，代理原样透传 |
+| `UPSTREAM_BASE_URL` | 是 | 上游 LLM API 地址，未设则代理不启动（MCP 工具仍可用） |
 
 **MCP server 端**（`~/.claude.json` 的 `mcpServers.vision-mcp.env`）：
 
 | 环境变量 | 必填 | 默认值 | 说明 |
 |---------|------|--------|------|
-| `UPSTREAM_BASE_URL` | 是 | - | 上游 LLM API 地址，未设则代理不启动（MCP 工具仍可用） |
-| `UPSTREAM_AUTH_TOKEN` | 否 | 取自 `ANTHROPIC_AUTH_TOKEN` | 上游认证 token |
 | `VISION_API_KEY` | 是 | - | 视觉模型 API key（MCP 工具与代理共用） |
 | `VISION_BASE_URL` | 是 | - | 视觉模型 API 端点（见支持的平台表） |
 | `VISION_MODEL` | 是 | - | 视觉模型 ID（见支持的平台表） |
@@ -173,6 +171,17 @@ MCP 工具和代理共享同一进程、同一份视觉模型配置，启动 MCP
 | `IMAGE_DESC_PROMPT` | 否 | 内置自动分类提示词 | 完全覆盖代理识图提示词。设置后不再使用 `IMAGE_DESC_MODE` 内置模板 |
 | `ALLOW_PRIVATE_NETWORK_IMAGES` | 否 | - | 设为 `1` 或 `true` 允许访问内网图片 URL（默认拒绝，防 SSRF） |
 
+
+#### 配置变更生效方式
+
+MCP server 进程与图片代理的生命周期不同，配置变更的生效方式也不同：
+
+| 变更内容 | 生效方式 |
+|---------|---------|
+| `~/.claude.json` 的 `mcpServers.vision-mcp.env`（如 `VISION_MODEL`、`IMAGE_DESC_MODE`） | 重连 MCP server（`/mcp` 重连），无需重启 Claude Code |
+| `~/.claude/settings.json` 顶层 `env`（如 `UPSTREAM_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL`） | 重启 Claude Code |
+
+图片代理是独立常驻进程。MCP 重连时，代理通过配置指纹（`VISION_API_KEY`、`VISION_BASE_URL`、`VISION_MODEL`、`UPSTREAM_BASE_URL`、`ANTHROPIC_BASE_URL`、`IMAGE_DESC_MODE`、`IMAGE_DESC_PROMPT` 的 sha256）检测配置变化，自动停旧拉新--纯配置变更无需手动 kill 或重新 build。
 
 ## 使用示例
 
