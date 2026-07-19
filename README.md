@@ -167,7 +167,6 @@ MCP 工具和代理共享同一进程、同一份视觉模型配置，启动 MCP
 | `VISION_BASE_URL` | 是 | - | 视觉模型 API 端点（见支持的平台表） |
 | `VISION_MODEL` | 是 | - | 视觉模型 ID（见支持的平台表） |
 | `IMAGE_DESC_MODE` | 否 | `auto` | 识图模式：`auto` 自动判断设计图/原型图/bug 截图；也可设为 `design_rebuild`、`prototype_understanding`、`bug_screenshot`、`general` |
-| `VISION_MAX_TOKENS` | 否 | `2048` | 视觉模型返回 token 上限，1-8192。复杂设计图建议 4096 或 8192 |
 | `IMAGE_DESC_PROMPT` | 否 | 内置自动分类提示词 | 完全覆盖代理识图提示词。设置后不再使用 `IMAGE_DESC_MODE` 内置模板 |
 | `ALLOW_PRIVATE_NETWORK_IMAGES` | 否 | - | 设为 `1` 或 `true` 允许访问内网图片 URL（默认拒绝，防 SSRF） |
 
@@ -214,7 +213,6 @@ Claude 会自动调用 `vision_describe_image` 工具。
 | `image` | string | 是 | - | 本地文件路径或 http(s):// 图片 URL |
 | `prompt` | string | 否 | "请详细描述这张图片的内容。" | 识图指令，最长 4000 字符 |
 | `mode` | string | 否 | `auto` | `auto`、`design_rebuild`、`prototype_understanding`、`bug_screenshot`、`general` |
-| `max_tokens` | number | 否 | 由 `VISION_MAX_TOKENS` 控制，未设置为 2048 | 返回描述的最大 token 数，1-8192 |
 
 ## 限制
 

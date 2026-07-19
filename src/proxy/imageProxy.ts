@@ -7,8 +7,17 @@ import path from "path";
 import os from "os";
 import { spawn } from "child_process";
 import crypto from "crypto";
-import { callVision } from "../services/vision.js";
+import {
+  buildEmptyVisionContentError,
+  callVision,
+  extractVisionText,
+} from "../services/vision.js";
 import { DEFAULT_MAX_TOKENS } from "../constants.js";
+import {
+  buildImageDescriptionPlan,
+  nextMaxTokens,
+  shouldRetryWithMoreTokens,
+} from "../services/imageDescriptionPlan.js";
 import {
   DEFAULT_IMAGE_DESC_MODE,
   buildImageDescriptionPrompt,
@@ -194,11 +203,11 @@ async function describeImage(
     throw new Error("请求已取消");
   }
 
-  const effectivePrompt =
+  const initialPrompt =
     IMAGE_DESC_PROMPT || buildImageDescriptionPrompt(DEFAULT_IMAGE_DESC_MODE, userPrompt);
 
   // 成功缓存命中：历史消息里反复出现的同一张图不重复调 视觉模型
-  const cached = getCachedDescription(base64Data, effectivePrompt);
+  const cached = getCachedDescription(base64Data, initialPrompt);
   if (cached) {
     log(`${requestId ? `${requestLabel(requestId)} ` : ""}[image-proxy] 图片命中缓存，跳过识别`);
     return cached;
@@ -210,7 +219,7 @@ async function describeImage(
     throw new Error("VISION_API_KEY 未设置");
   }
 
-  const key = hashImage(base64Data, effectivePrompt);
+  const key = hashImage(base64Data, initialPrompt);
   const pending = pendingImageDescriptions.get(key);
   if (pending) {
     log(`${requestId ? `${requestLabel(requestId)} ` : ""}[image-proxy] 图片识别进行中，复用同一个请求`);
@@ -228,27 +237,56 @@ async function describeImage(
       let lastError: unknown;
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
-          const response = await callVision({
-            apiKey,
-            messages: [
-              {
-                role: "user",
-                content: [
-                  { type: "image_url", image_url: { url: dataUrl } },
-                  { type: "text", text: effectivePrompt },
-                ],
-              },
-            ],
-            maxTokens: DEFAULT_MAX_TOKENS,
-            signal: task.controller.signal,
-          });
+          const plan = IMAGE_DESC_PROMPT
+            ? {
+                prompt: IMAGE_DESC_PROMPT,
+                maxTokens: DEFAULT_MAX_TOKENS,
+                allowTokenEscalation: true,
+              }
+            : buildImageDescriptionPlan({
+                mode: DEFAULT_IMAGE_DESC_MODE,
+                userPrompt,
+              });
 
-          const description = response.choices?.[0]?.message?.content || "";
-          if (!description) {
-            throw new Error("视觉模型 API 返回空内容");
+          let maxTokens = plan.maxTokens;
+          while (true) {
+            const response = await callVision({
+              apiKey,
+              messages: [
+                {
+                  role: "user",
+                  content: [
+                    { type: "image_url", image_url: { url: dataUrl } },
+                    { type: "text", text: plan.prompt },
+                  ],
+                },
+              ],
+              maxTokens,
+              signal: task.controller.signal,
+            });
+
+            const description = extractVisionText(response);
+            const nextTokens = plan.allowTokenEscalation && shouldRetryWithMoreTokens(response, description)
+              ? nextMaxTokens(maxTokens)
+              : null;
+            if (nextTokens) {
+              log(
+                `${requestId ? `${requestLabel(requestId)} ` : ""}[image-proxy] ` +
+                `图片识别输出不足，max_tokens ${maxTokens} -> ${nextTokens} 后重试`
+              );
+              maxTokens = nextTokens;
+              continue;
+            }
+
+            if (!description) {
+              throw new Error(buildEmptyVisionContentError(response, maxTokens));
+            }
+            setCachedDescription(base64Data, plan.prompt, description);
+            if (plan.prompt !== initialPrompt) {
+              setCachedDescription(base64Data, initialPrompt, description);
+            }
+            return description;
           }
-          setCachedDescription(base64Data, effectivePrompt, description);
-          return description;
         } catch (err) {
           lastError = err;
           if (isCanceledError(err) || attempt === 2) {
@@ -927,7 +965,10 @@ export function startImageProxy(): Promise<void> {
     server.listen(PROXY_PORT, "127.0.0.1", () => {
       log(`[image-proxy] 代理已启动: http://127.0.0.1:${PROXY_PORT} (pid ${process.pid})`);
       log(`[image-proxy] 上游 API: ${UPSTREAM_BASE_URL}`);
-      log(`[image-proxy] 识图模式: ${IMAGE_DESC_PROMPT ? "custom IMAGE_DESC_PROMPT" : DEFAULT_IMAGE_DESC_MODE}, max_tokens=${DEFAULT_MAX_TOKENS}`);
+      log(
+        `[image-proxy] 识图模式: ${IMAGE_DESC_PROMPT ? "custom IMAGE_DESC_PROMPT" : DEFAULT_IMAGE_DESC_MODE}, ` +
+        "max_tokens=dynamic"
+      );
       resolve();
     });
   });

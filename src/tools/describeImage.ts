@@ -1,9 +1,21 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { DescribeImageInputSchema } from "../schemas.js";
-import { DEFAULT_MODEL, CHARACTER_LIMIT } from "../constants.js";
+import {
+  DEFAULT_MODEL,
+  CHARACTER_LIMIT,
+} from "../constants.js";
 import { loadImageAsDataUrl } from "../services/image.js";
-import { callVision, handleVisionError } from "../services/vision.js";
-import { buildImageDescriptionPrompt } from "../prompts.js";
+import {
+  buildImageDescriptionPlan,
+  nextMaxTokens,
+  shouldRetryWithMoreTokens,
+} from "../services/imageDescriptionPlan.js";
+import {
+  buildEmptyVisionContentError,
+  callVision,
+  extractVisionText,
+  handleVisionError,
+} from "../services/vision.js";
 import type { DescribeImageInput } from "../schemas.js";
 import type { VisionContent, VisionMessage } from "../types.js";
 
@@ -25,7 +37,6 @@ Args:
     - URL 示例: "https://example.com/img.png"
   - prompt (string, 可选): 额外识图指令，会附加到当前 mode 的提示词模板后；不传则仅使用模式模板（默认 auto 自动分类）。最长 4000 字符
   - mode (string, 可选): auto / design_rebuild / prototype_understanding / bug_screenshot / general，默认 auto
-  - max_tokens (number, 可选): 返回描述的最大 token 数，1-8192，默认由 VISION_MAX_TOKENS 控制，未设置为 2048
 
 Returns:
   文本内容。默认会先自动判断图片类型，再输出适合设计图还原、原型图理解或 bug 截图分析的结构化结果，并附带 token 使用情况元信息。
@@ -70,7 +81,11 @@ Error Handling:
       }
 
       // 2. 构造视觉模型请求
-      const visionPrompt = buildImageDescriptionPrompt(params.mode, params.prompt);
+      const plan = buildImageDescriptionPlan({
+        mode: params.mode,
+        userPrompt: params.prompt,
+      });
+      const visionPrompt = plan.prompt;
       const content: VisionContent[] = [
         { type: "image_url", image_url: { url: imageResult.dataUrl } },
         { type: "text", text: visionPrompt },
@@ -79,13 +94,24 @@ Error Handling:
 
       // 3. 调用视觉模型 API
       let response;
+      let description = "";
+      let maxTokens = plan.maxTokens;
       try {
-        response = await callVision({
-          apiKey,
-          model: DEFAULT_MODEL,
-          messages,
-          maxTokens: params.max_tokens,
-        });
+        while (true) {
+          response = await callVision({
+            apiKey,
+            model: DEFAULT_MODEL,
+            messages,
+            maxTokens,
+          });
+
+          description = extractVisionText(response);
+          const nextTokens = plan.allowTokenEscalation && shouldRetryWithMoreTokens(response, description)
+            ? nextMaxTokens(maxTokens)
+            : null;
+          if (!nextTokens) break;
+          maxTokens = nextTokens;
+        }
       } catch (err) {
         return {
           content: [{ type: "text", text: handleVisionError(err) }],
@@ -93,13 +119,12 @@ Error Handling:
       }
 
       // 4. 提取描述
-      const description = response.choices?.[0]?.message?.content ?? "";
       if (!description) {
         return {
           content: [
             {
               type: "text",
-              text: `Error: 视觉模型 API 返回空内容。完整响应: ${JSON.stringify(response)}`,
+              text: `Error: ${buildEmptyVisionContentError(response, maxTokens)}。完整响应: ${JSON.stringify(response)}`,
             },
           ],
         };

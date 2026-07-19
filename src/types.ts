@@ -19,7 +19,8 @@ export interface VisionChoice {
   index: number;
   message: {
     role: string;
-    content: string;
+    content?: string | Array<{ type?: string; text?: string; [key: string]: unknown }> | null;
+    reasoning_content?: string;
   };
   finish_reason: string;
 }

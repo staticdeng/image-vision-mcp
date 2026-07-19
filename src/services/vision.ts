@@ -2,7 +2,12 @@ import axios, { AxiosError } from "axios";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { API_BASE_URL, DEFAULT_MODEL, REQUEST_TIMEOUT_MS } from "../constants.js";
+import {
+  API_BASE_URL,
+  DEFAULT_MAX_TOKENS,
+  DEFAULT_MODEL,
+  REQUEST_TIMEOUT_MS,
+} from "../constants.js";
 import type { VisionChatResponse, VisionMessage, VisionContent } from "../types.js";
 
 const PROJECT_ROOT = path.resolve(
@@ -130,11 +135,62 @@ function summarizeVisionResponse(response: VisionChatResponse): unknown {
       index: choice.index,
       finish_reason: choice.finish_reason,
       message_role: choice.message?.role,
-      content_chars: choice.message?.content?.length ?? 0,
-      content_preview: choice.message?.content?.slice(0, 160) ?? "",
+      content_chars: extractMessageText(choice.message).length,
+      content_preview: extractMessageText(choice.message).slice(0, 160),
+      reasoning_chars: choice.message?.reasoning_content?.length ?? 0,
     })) ?? [],
     usage: response.usage,
   };
+}
+
+function extractContentText(content: VisionChatResponse["choices"][number]["message"]["content"]): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((block) => {
+      if (typeof block?.text === "string") return block.text;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function extractMessageText(message: VisionChatResponse["choices"][number]["message"] | undefined): string {
+  if (!message) return "";
+  return extractContentText(message.content);
+}
+
+export function extractVisionText(response: VisionChatResponse): string {
+  return extractMessageText(response.choices?.[0]?.message).trim();
+}
+
+export function buildEmptyVisionContentError(
+  response: VisionChatResponse,
+  maxTokens: number
+): string {
+  const choice = response.choices?.[0];
+  const finishReason = choice?.finish_reason || "unknown";
+  const reasoningChars = choice?.message?.reasoning_content?.length ?? 0;
+  const totalTokens = response.usage?.total_tokens ?? "unknown";
+  const completionTokens = response.usage?.completion_tokens ?? "unknown";
+
+  if (finishReason === "length") {
+    return (
+      `视觉模型 API 返回空内容：响应因 max_tokens=${maxTokens} 截断，` +
+      `completion_tokens=${completionTokens}, total_tokens=${totalTokens}。` +
+      "如果自动升档后仍发生截断，请改用支持更长输出的视觉模型。"
+    );
+  }
+
+  if (reasoningChars > 0) {
+    return (
+      `视觉模型 API 返回空内容：模型只返回了 reasoning_content (${reasoningChars} chars)，` +
+      `finish_reason=${finishReason}。请更换支持非推理输出或更长输出的视觉模型。`
+    );
+  }
+
+  return `视觉模型 API 返回空内容：finish_reason=${finishReason}`;
 }
 
 // 重试退避也要响应取消，否则客户端已经中断时还会继续占着任务。
@@ -155,7 +211,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 export async function callVision(params: CallVisionParams): Promise<VisionChatResponse> {
-  const { apiKey, model = DEFAULT_MODEL, messages, maxTokens = 2048, signal } = params;
+  const { apiKey, model = DEFAULT_MODEL, messages, maxTokens = DEFAULT_MAX_TOKENS, signal } = params;
   if (!apiKey) {
     throw new Error("VISION_API_KEY 未设置");
   }
